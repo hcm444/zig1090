@@ -1,0 +1,556 @@
+const std = @import("std");
+const rtl_iq = @import("rtl_iq.zig");
+const adsb = @import("adsb/adsb_payload.zig");
+const crc = @import("mode_s/mode_s_crc.zig");
+const demod = @import("mode_s/mode_s_demod.zig");
+const msdec = @import("mode_s/mode_s_decode.zig");
+const aircraft_table = @import("ui/aircraft_table.zig");
+const web = @import("ui/web.zig");
+
+const C32 = std.math.Complex(f32);
+
+const DEFAULT_CENTER_HZ: f64 = 1090e6;
+const DEFAULT_SAMPLE_RATE: f64 = 2.0e6;
+
+const Cli = struct {
+    verbose: bool,
+    center_hz: f64,
+    sample_rate_hz: f64,
+    receiver_lat: ?f64,
+    receiver_lon: ?f64,
+    /// When set, serve map + `/aircraft.json` on this TCP port (`--http` or `--http <port>`).
+    http_port: ?u16,
+    preamble_score_min: f32,
+    timing_search_halfspan_samples: f64,
+    rescue_conf_scale: f32,
+    crc_two_bit_max_pairs: usize,
+    overlap_rescan_samples: usize,
+    phase_enhance_weight: f32,
+};
+
+fn parseCli(argv: []const []const u8) Cli {
+    var verbose = false;
+    var center: ?f64 = null;
+    var rate: ?f64 = null;
+    var rlat: ?f64 = null;
+    var rlon: ?f64 = null;
+    var http_port: ?u16 = null;
+    var preamble_score_min: f32 = 2.0;
+    var timing_search_halfspan_samples: f64 = 0.20;
+    var rescue_conf_scale: f32 = 1.20;
+    var crc_two_bit_max_pairs: usize = 180;
+    var overlap_rescan_samples: usize = 48;
+    var phase_enhance_weight: f32 = 0.35;
+
+    var i: usize = 1;
+    while (i < argv.len) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
+            verbose = true;
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--http")) {
+            if (i + 1 < argv.len) {
+                if (std.fmt.parseInt(u16, argv[i + 1], 10)) |p| {
+                    if (p != 0) {
+                        http_port = p;
+                        i += 2;
+                        continue;
+                    }
+                } else |_| {}
+            }
+            http_port = 8080;
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--lat")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --lat <deg> requires a value\n", .{});
+                std.posix.exit(2);
+            }
+            rlat = std.fmt.parseFloat(f64, argv[i + 1]) catch {
+                std.debug.print("invalid --lat\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--lon")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --lon <deg> requires a value\n", .{});
+                std.posix.exit(2);
+            }
+            rlon = std.fmt.parseFloat(f64, argv[i + 1]) catch {
+                std.debug.print("invalid --lon\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--preamble-score-min")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --preamble-score-min <value>\n", .{});
+                std.posix.exit(2);
+            }
+            preamble_score_min = std.fmt.parseFloat(f32, argv[i + 1]) catch {
+                std.debug.print("invalid --preamble-score-min\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--timing-search-halfspan")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --timing-search-halfspan <samples>\n", .{});
+                std.posix.exit(2);
+            }
+            timing_search_halfspan_samples = std.fmt.parseFloat(f64, argv[i + 1]) catch {
+                std.debug.print("invalid --timing-search-halfspan\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--rescue-conf-scale")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --rescue-conf-scale <factor>\n", .{});
+                std.posix.exit(2);
+            }
+            rescue_conf_scale = std.fmt.parseFloat(f32, argv[i + 1]) catch {
+                std.debug.print("invalid --rescue-conf-scale\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--crc-two-bit-max-pairs")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --crc-two-bit-max-pairs <count>\n", .{});
+                std.posix.exit(2);
+            }
+            crc_two_bit_max_pairs = std.fmt.parseInt(usize, argv[i + 1], 10) catch {
+                std.debug.print("invalid --crc-two-bit-max-pairs\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--overlap-rescan-samples")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --overlap-rescan-samples <count>\n", .{});
+                std.posix.exit(2);
+            }
+            overlap_rescan_samples = std.fmt.parseInt(usize, argv[i + 1], 10) catch {
+                std.debug.print("invalid --overlap-rescan-samples\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--phase-enhance-weight")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --phase-enhance-weight <0.0..1.0>\n", .{});
+                std.posix.exit(2);
+            }
+            phase_enhance_weight = std.fmt.parseFloat(f32, argv[i + 1]) catch {
+                std.debug.print("invalid --phase-enhance-weight\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
+        const f = std.fmt.parseFloat(f64, a) catch {
+            std.debug.print("unknown argument: {s}\n", .{a});
+            std.posix.exit(2);
+        };
+        if (center == null) {
+            center = f;
+        } else if (rate == null) {
+            rate = f;
+        } else {
+            std.debug.print("extra positional argument (expected at most center_hz sample_rate_hz)\n", .{});
+            std.posix.exit(2);
+        }
+        i += 1;
+    }
+
+    if ((rlat == null) != (rlon == null)) {
+        std.debug.print("use both --lat and --lon (WGS84 degrees), or neither\n", .{});
+        std.posix.exit(2);
+    }
+    if (rlat) |la| {
+        if (la < -90.0 or la > 90.0) {
+            std.debug.print("--lat must be between -90 and 90\n", .{});
+            std.posix.exit(2);
+        }
+    }
+    if (rlon) |lo| {
+        if (lo < -180.0 or lo > 180.0) {
+            std.debug.print("--lon must be between -180 and 180\n", .{});
+            std.posix.exit(2);
+        }
+    }
+    if (timing_search_halfspan_samples < 0.0 or timing_search_halfspan_samples > 0.75) {
+        std.debug.print("--timing-search-halfspan must be between 0.0 and 0.75 samples\n", .{});
+        std.posix.exit(2);
+    }
+    if (rescue_conf_scale < 1.0 or rescue_conf_scale > 3.0) {
+        std.debug.print("--rescue-conf-scale must be between 1.0 and 3.0\n", .{});
+        std.posix.exit(2);
+    }
+    if (crc_two_bit_max_pairs > 4000) {
+        std.debug.print("--crc-two-bit-max-pairs must be <= 4000\n", .{});
+        std.posix.exit(2);
+    }
+    if (phase_enhance_weight < 0.0 or phase_enhance_weight > 1.0) {
+        std.debug.print("--phase-enhance-weight must be between 0.0 and 1.0\n", .{});
+        std.posix.exit(2);
+    }
+
+    return .{
+        .verbose = verbose,
+        .center_hz = center orelse DEFAULT_CENTER_HZ,
+        .sample_rate_hz = rate orelse DEFAULT_SAMPLE_RATE,
+        .receiver_lat = rlat,
+        .receiver_lon = rlon,
+        .http_port = http_port,
+        .preamble_score_min = preamble_score_min,
+        .timing_search_halfspan_samples = timing_search_halfspan_samples,
+        .rescue_conf_scale = rescue_conf_scale,
+        .crc_two_bit_max_pairs = crc_two_bit_max_pairs,
+        .overlap_rescan_samples = overlap_rescan_samples,
+        .phase_enhance_weight = phase_enhance_weight,
+    };
+}
+const FRAME_N: usize = 8192;
+comptime {
+    std.debug.assert(FRAME_N == rtl_iq.frame_len);
+}
+const TABLE_REFRESH_NS: i128 = 250 * std.time.ns_per_ms;
+const MIN_SAMPLE_RATE_HZ: f64 = 1.8e6;
+
+fn fillEnergy(samples: []const C32, energy: []f32) void {
+    std.debug.assert(samples.len == energy.len);
+    for (samples, 0..) |s, i| {
+        const re: f32 = s.re;
+        const im: f32 = s.im;
+        energy[i] = re * re + im * im;
+    }
+}
+
+const NoiseEstimator = struct {
+    mean: f32 = 0.0,
+    var_pop: f32 = 1.0,
+    initialized: bool = false,
+    /// EMA blend; lower = steadier, higher = more responsive.
+    alpha: f32 = 0.05,
+    /// Subsample stride for per-frame estimation.
+    stride: usize = 16,
+
+    fn update(self: *NoiseEstimator, energy: []const f32) void {
+        // Subsample Welford over the frame to avoid full-frame passes.
+        var mean: f32 = 0.0;
+        var m2: f32 = 0.0;
+        var n: f32 = 0.0;
+
+        var i: usize = 0;
+        const step = @max(@as(usize, 1), self.stride);
+        while (i < energy.len) : (i += step) {
+            const x = energy[i];
+            n += 1.0;
+            const delta = x - mean;
+            mean += delta / n;
+            const delta2 = x - mean;
+            m2 += delta * delta2;
+        }
+
+        const var_pop = m2 / @max(1.0, n);
+
+        if (!self.initialized) {
+            self.mean = mean;
+            self.var_pop = var_pop;
+            self.initialized = true;
+            return;
+        }
+
+        const a = self.alpha;
+        self.mean = self.mean * (1.0 - a) + mean * a;
+        self.var_pop = self.var_pop * (1.0 - a) + var_pop * a;
+    }
+
+    fn stddev(self: *const NoiseEstimator) f32 {
+        return @sqrt(self.var_pop + 1e-12);
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    const cli = parseCli(args);
+    const verbose = cli.verbose;
+    const center_hz = cli.center_hz;
+    const sample_rate_hz = cli.sample_rate_hz;
+
+    if (sample_rate_hz < MIN_SAMPLE_RATE_HZ) {
+        std.debug.print("sample rate must be at least 1.8e6 Hz (Mode S Manchester timing).\n", .{});
+        std.posix.exit(1);
+    }
+
+    const dparams = demod.DemodParams.init(sample_rate_hz);
+
+    crc.initTables();
+
+    // Keep stderr quiet: driver chatter draws below the fullscreen table on the same TTY.
+    var iq = rtl_iq.RtlIqStream.init(allocator, center_hz, sample_rate_hz, .{ .debug = false }) catch |err| switch (err) {
+        error.SdrNotDetected => {
+            std.debug.print("SDR not detected.\n", .{});
+            std.posix.exit(1);
+        },
+        else => |e| return e,
+    };
+    defer iq.deinit();
+    try iq.start();
+
+    var stdout_buf: [16384]u8 = undefined;
+
+    // Alternate screen: table redraws on stdout only; stderr (libusb, etc.) won't sit under it.
+    if (!verbose) {
+        try std.fs.File.stdout().writeAll("\x1b[?1049h");
+    }
+    defer if (!verbose) {
+        _ = std.fs.File.stdout().writeAll("\x1b[?1049l") catch {};
+    };
+
+    if (verbose) {
+        std.debug.print(
+            "Verbose: per-message lines on stderr; fullscreen table disabled. Center={d:.3} MHz\n",
+            .{center_hz / 1e6},
+        );
+    }
+
+    var energy: [FRAME_N]f32 = undefined;
+    var bits: [112]u1 = undefined;
+    var bits_scratch: [112]u1 = undefined;
+    var peek_byte: [1]u8 = undefined;
+
+    var cpr_map = std.AutoHashMap(u32, adsb.CprAirborneState).init(allocator);
+    defer cpr_map.deinit();
+    var cpr_surface_map = std.AutoHashMap(u32, adsb.CprSurfaceState).init(allocator);
+    defer cpr_surface_map.deinit();
+
+    var ac_table = aircraft_table.Table.init(allocator, cli.receiver_lat, cli.receiver_lon);
+    defer ac_table.deinit();
+
+    var web_sh: web.Shared = undefined;
+    var web_sh_ptr: ?*web.Shared = null;
+    var http_thread: ?std.Thread = null;
+    if (cli.http_port) |hp| {
+        web_sh = .{ .table = &ac_table, .center_mhz = center_hz / 1e6 };
+        web_sh_ptr = &web_sh;
+        http_thread = try web.spawnListener(&web_sh, hp);
+    }
+    defer if (http_thread) |t| t.join();
+
+    var last_table_draw_ns: i128 = 0;
+    var noise = NoiseEstimator{};
+    var last_accept_i: usize = std.math.maxInt(usize);
+    var last_accept_len: usize = 0;
+    var last_accept_bits: usize = 0;
+    var last_accept_hash: u64 = 0;
+
+    while (true) {
+        iq.wait(FRAME_N, 200 * std.time.ns_per_ms) catch |err| switch (err) {
+            error.Timeout => continue,
+            error.EndOfStream => break,
+        };
+
+        const available = iq.get();
+        if (available.len < FRAME_N) continue;
+        const frame = available[0..FRAME_N];
+        fillEnergy(frame, &energy);
+        noise.update(&energy);
+        const noise_mean = noise.mean;
+        const noise_std = noise.stddev();
+        const now_ns = std.time.nanoTimestamp();
+
+        var i: usize = 0;
+        while (i + dparams.messageExtentSamples(112) < FRAME_N) {
+            const preamble_score = demod.preambleScore(&energy, i, noise_mean, dparams);
+            if (preamble_score < cli.preamble_score_min) {
+                i += 1;
+                continue;
+            }
+            if (last_accept_len != 0) {
+                const overlap_end = last_accept_i + last_accept_len;
+                if (i > last_accept_i and i < overlap_end and i > last_accept_i + cli.overlap_rescan_samples) {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            const data_start = @as(f64, @floatFromInt(i + dparams.preamble_samples));
+            const phase_ref = demod.estimatePreamblePhaseRef(frame, i, dparams);
+            const timing_halfspan = cli.timing_search_halfspan_samples;
+            const offsets_primary = [_]f64{
+                -timing_halfspan,
+                0.0,
+                timing_halfspan,
+            };
+
+            _ = demod.decodeBitsManchesterBestOffsetPhaseEnhanced(
+                &energy,
+                frame,
+                data_start,
+                bits[0..5],
+                bits_scratch[0..5],
+                dparams.samples_per_half_chip,
+                &offsets_primary,
+                phase_ref,
+                cli.phase_enhance_weight,
+            );
+            demod.bitsToBytes(bits[0..5], &peek_byte);
+            const df = (peek_byte[0] >> 3) & 0x1f;
+            const bit_len = msdec.modeSBitLength(df);
+
+            if (i + dparams.messageExtentSamples(bit_len) > FRAME_N) {
+                i += 1;
+                continue;
+            }
+
+            var conf = demod.decodeBitsManchesterBestOffsetPhaseEnhanced(
+                &energy,
+                frame,
+                data_start,
+                bits[0..bit_len],
+                bits_scratch[0..bit_len],
+                dparams.samples_per_half_chip,
+                &offsets_primary,
+                phase_ref,
+                cli.phase_enhance_weight,
+            );
+            if (conf < noise_std * 0.15) {
+                i += 1;
+                continue;
+            }
+            const rescue_threshold = (noise_std * 0.15) * cli.rescue_conf_scale;
+            const offsets_rescue = [_]f64{
+                -timing_halfspan,
+                -timing_halfspan * 0.5,
+                0.0,
+                timing_halfspan * 0.5,
+                timing_halfspan,
+            };
+
+            if (bit_len == 56) {
+                var msg7: [7]u8 = undefined;
+                demod.bitsToBytes(bits[0..56], &msg7);
+                var crc_ok = crc.acceptOrFixSingleBit56(&msg7);
+                if (!crc_ok and conf >= rescue_threshold) {
+                    conf = demod.decodeBitsManchesterBestOffsetPhaseEnhanced(
+                        &energy,
+                        frame,
+                        data_start,
+                        bits[0..56],
+                        bits_scratch[0..56],
+                        dparams.samples_per_half_chip,
+                        &offsets_rescue,
+                        phase_ref,
+                        cli.phase_enhance_weight,
+                    );
+                    demod.bitsToBytes(bits[0..56], &msg7);
+                    crc_ok = crc.acceptOrFixTwoBit56(&msg7, cli.crc_two_bit_max_pairs);
+                }
+                if (!crc_ok) {
+                    i += 1;
+                    continue;
+                }
+                const msg_hash = std.hash.Wyhash.hash(0, &msg7);
+                if (last_accept_bits == 56 and last_accept_hash == msg_hash and i <= last_accept_i + cli.overlap_rescan_samples) {
+                    i += 1;
+                    continue;
+                }
+                const conf64: f64 = @as(f64, conf);
+                if (web_sh_ptr) |ws| {
+                    ws.mutex.lock();
+                    defer ws.mutex.unlock();
+                    try ac_table.updateFromModeSMessage(now_ns, &msg7, 56, df, conf64, &cpr_map, &cpr_surface_map);
+                } else {
+                    try ac_table.updateFromModeSMessage(now_ns, &msg7, 56, df, conf64, &cpr_map, &cpr_surface_map);
+                }
+                if (verbose) msdec.printVerbose(&msg7, 56, df, conf64);
+                last_accept_hash = msg_hash;
+            } else {
+                var msg14: [14]u8 = undefined;
+                demod.bitsToBytes(bits[0..112], &msg14);
+                var crc_ok = crc.acceptOrFixSingleBit(&msg14);
+                if (!crc_ok and conf >= rescue_threshold) {
+                    conf = demod.decodeBitsManchesterBestOffsetPhaseEnhanced(
+                        &energy,
+                        frame,
+                        data_start,
+                        bits[0..112],
+                        bits_scratch[0..112],
+                        dparams.samples_per_half_chip,
+                        &offsets_rescue,
+                        phase_ref,
+                        cli.phase_enhance_weight,
+                    );
+                    demod.bitsToBytes(bits[0..112], &msg14);
+                    crc_ok = crc.acceptOrFixTwoBit(&msg14, cli.crc_two_bit_max_pairs);
+                }
+                if (!crc_ok) {
+                    i += 1;
+                    continue;
+                }
+                const msg_hash = std.hash.Wyhash.hash(0, &msg14);
+                if (last_accept_bits == 112 and last_accept_hash == msg_hash and i <= last_accept_i + cli.overlap_rescan_samples) {
+                    i += 1;
+                    continue;
+                }
+                const icao: u32 = (@as(u32, msg14[1]) << 16) | (@as(u32, msg14[2]) << 8) | @as(u32, msg14[3]);
+                if (icao == 0) {
+                    i += 1;
+                    continue;
+                }
+                const conf64: f64 = @as(f64, conf);
+                if (web_sh_ptr) |ws| {
+                    ws.mutex.lock();
+                    defer ws.mutex.unlock();
+                    try ac_table.updateFromModeSMessage(now_ns, &msg14, 112, df, conf64, &cpr_map, &cpr_surface_map);
+                } else {
+                    try ac_table.updateFromModeSMessage(now_ns, &msg14, 112, df, conf64, &cpr_map, &cpr_surface_map);
+                }
+                if (verbose) msdec.printVerbose(&msg14, 112, df, conf64);
+                last_accept_hash = msg_hash;
+            }
+
+            const accepted_extent = dparams.messageExtentSamples(bit_len);
+            last_accept_i = i;
+            last_accept_len = accepted_extent;
+            last_accept_bits = bit_len;
+            const advance = if (accepted_extent > cli.overlap_rescan_samples) accepted_extent - cli.overlap_rescan_samples else 1;
+            i += advance;
+        }
+
+        if (!verbose and now_ns - last_table_draw_ns >= TABLE_REFRESH_NS) {
+            last_table_draw_ns = now_ns;
+            var stdout_wr = std.fs.File.stdout().writer(&stdout_buf);
+            if (web_sh_ptr) |ws| {
+                ws.mutex.lock();
+                defer ws.mutex.unlock();
+                try ac_table.render(&stdout_wr.interface, now_ns, center_hz / 1e6);
+            } else {
+                try ac_table.render(&stdout_wr.interface, now_ns, center_hz / 1e6);
+            }
+            try stdout_wr.interface.flush();
+        }
+
+        iq.update(FRAME_N);
+    }
+}

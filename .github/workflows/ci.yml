@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}, Zig ${{ matrix.zig-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig-version: [0.15.0]
+
+    steps:
+      - name: Checkout zig1090
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Install librtlsdr (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librtlsdr-dev libusb-1.0-0-dev
+
+      - name: Install librtlsdr (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install librtlsdr
+
+      - name: Install librtlsdr (Windows via vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          .\vcpkg\vcpkg install rtlsdr:x64-windows
+          $lib = (Resolve-Path ".\vcpkg\installed\x64-windows\lib").Path
+          $include = (Resolve-Path ".\vcpkg\installed\x64-windows\include").Path
+          "LIB=$lib" >> $env:GITHUB_ENV
+          "INCLUDE=$include" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: zig build
+
+  build-arch-linux:
+    name: Build (archlinux, Zig repo version)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout zig1090
+        uses: actions/checkout@v4
+
+      - name: Build in Arch Linux container
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            archlinux:latest \
+            bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm --needed zig git rtl-sdr libusb
+              zig version
+              zig build
+            '

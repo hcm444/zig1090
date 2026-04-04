@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zig1090 map</title>
+  <link rel="stylesheet" href="/static/leaflet/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    #map { height: 100%; width: 100%; }
+    #panel {
+      position: absolute; top: 10px; right: 10px; z-index: 1000;
+      background: rgba(0,0,0,.78); color: #e8e8e8; padding: 12px 14px;
+      border-radius: 8px; max-width: min(420px, 92vw); font-size: 13px;
+      line-height: 1.45; pointer-events: auto;
+    }
+    #panel h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #fff; }
+    #panel .muted { color: #9aa; font-size: 12px; }
+    #panel kbd { display: block; margin-top: 8px; color: #7ad; font-size: 11px; }
+    .controls { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; margin: 8px 0 2px; }
+    .controls label { color: #d7d7d7; font-size: 12px; }
+    .controls input { transform: translateY(1px); }
+
+    .ac-arrow-wrap {
+      width: 0 !important; height: 0 !important;
+    }
+    .ac-arrow {
+      margin-left: -12px; margin-top: -12px;
+      width: 24px; height: 24px; text-align: center; line-height: 24px;
+      font-size: 18px; color: #0af; text-shadow: 0 0 3px #000, 0 0 6px #000;
+      transform-origin: center center;
+    }
+
+    #acDetail .ac-detail { margin-top: 6px; font-size: 12px; line-height: 1.35; color: #e0e0e0; }
+    #acDetail .ac-detail h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: #fff; }
+    #acDetail .ac-detail .ac-line {
+      font-family: ui-monospace, monospace; font-size: 11px;
+      margin: 3px 0; word-break: break-word;
+    }
+    #acDetail .ac-detail .ac-hint { margin-top: 6px; color: #7ad; font-size: 10px; line-height: 1.3; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h2>zig1090</h2>
+    <div class="muted">Polls <code>/aircraft.json</code>. Range rings use receiver <code>--lat</code>/<code>--lon</code>.</div>
+    <div class="controls">
+      <label for="swLight">Light map</label> <input id="swLight" type="checkbox" />
+      <label for="swRanges">Range rings</label> <input id="swRanges" type="checkbox" />
+    </div>
+    <div id="acDetail"><p class="muted" style="margin:8px 0 0">Click an aircraft for the same fields as the terminal table.</p></div>
+    <kbd id="hint">Loading…</kbd>
+  </div>
+  <script src="/static/leaflet/leaflet.js"></script>
+  <script>
+(function () {
+  const panel = document.getElementById("panel");
+  const hint = document.getElementById("hint");
+  const swLight = document.getElementById("swLight");
+  const swRanges = document.getElementById("swRanges");
+  const acDetail = document.getElementById("acDetail");
+
+  const map = L.map("map", { zoomControl: true });
+  const lightTiles = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
+  });
+  // Dark basemap (free-ish; subject to provider usage policy).
+  const darkTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+  });
+
+  let tileLoadFailed = false;
+  function onTileErr() { tileLoadFailed = true; }
+  lightTiles.on("tileerror", onTileErr);
+  darkTiles.on("tileerror", onTileErr);
+
+  // Default to dark mode.
+  darkTiles.addTo(map);
+  swLight.checked = false;
+  swLight.addEventListener("change", () => {
+    if (swLight.checked) {
+      map.removeLayer(darkTiles);
+      lightTiles.addTo(map);
+    } else {
+      map.removeLayer(lightTiles);
+      darkTiles.addTo(map);
+    }
+  });
+
+  const layers = L.layerGroup().addTo(map);
+  let markers = {};
+  let trailLayers = {};
+  let didInitialView = false;
+  let ringLayer = null;
+  let lastReceiver = null;
+  let lastRingHits = null;
+  let lastRingTotal = 0;
+  let lastRingRates = null;
+  let selectedHex = null;
+
+  const defaultDetailHtml =
+    '<p class="muted" style="margin:8px 0 0">Click an aircraft for the same fields as the terminal table.</p>';
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function fmtVb(vr, isBaro) {
+    if (vr == null) return "—";
+    if (isBaro === true) return "B";
+    if (isBaro === false) return "G";
+    return "?";
+  }
+
+  function fmtSsNic(ss, nicB) {
+    if (ss == null || nicB == null) return "—";
+    return ss + "/" + nicB;
+  }
+
+  function hslAlt(altFt) {
+    if (altFt == null || !Number.isFinite(altFt)) return "#888";
+    const a = Math.max(0, Math.min(50000, altFt));
+    const h = 240 - (a / 50000) * 260;
+    if (swLight.checked) {
+      return "hsl(" + h + ", 86%, 34%)";
+    }
+    return "hsl(" + h + ", 82%, 52%)";
+  }
+
+  function timeColor(t, t0, t1) {
+    if (t1 <= t0) return swLight.checked ? "#143a5f" : "#0ad";
+    const u = Math.max(0, Math.min(1, (t - t0) / (t1 - t0)));
+    const h = 120 + u * 200;
+    const lightness = swLight.checked ? 30 : 50;
+    return "hsl(" + h + ", 80%, " + lightness + "%)";
+  }
+
+  function arrowIcon(trackDeg) {
+    const rot = (trackDeg != null && Number.isFinite(trackDeg)) ? trackDeg : 0;
+    const color = swLight.checked ? "#0f2136" : "#4ab8ff";
+    const shadow = swLight.checked
+      ? "0 0 2px rgba(255,255,255,0.95), 0 0 4px rgba(255,255,255,0.95)"
+      : "0 0 3px #000, 0 0 6px #000";
+    return L.divIcon({
+      className: "ac-arrow-wrap",
+      html: '<div class="ac-arrow" style="transform: rotate(' + (rot - 90) + 'deg);color:' + color + ';text-shadow:' + shadow + ';font-weight:700;">▶</div>',
+      iconSize: [0, 0],
+    });
+  }
+
+  function fmtAlt(x) { return x == null ? "—" : String(x) + " ft"; }
+  function fmtNum(x, suf) {
+    if (x == null || !Number.isFinite(x)) return "—";
+    return String(x) + (suf || "");
+  }
+
+  function resetDetailPanel() {
+    selectedHex = null;
+    acDetail.innerHTML = defaultDetailHtml;
+    clearTrails();
+  }
+
+  function showPanel(ac) {
+    const hex = escHtml(ac.hex || "");
+    const flightDisp = escHtml(((ac.flight || "").trim() || "(no callsign)"));
+    const trlN = (ac.trail && ac.trail.length) ? ac.trail.length : 0;
+
+    const pos = (ac.lat != null && ac.lon != null)
+      ? fmtNum(ac.lat, "°") + ", " + fmtNum(ac.lon, "°")
+      : "—";
+
+    const motionParts = [];
+    if (ac.on_ground) {
+      motionParts.push("ground");
+      if (ac.gs != null && Number.isFinite(ac.gs)) motionParts.push(fmtNum(ac.gs, " kt"));
+      if (ac.track != null && Number.isFinite(ac.track)) motionParts.push(fmtNum(ac.track, "°"));
+    } else {
+      if (ac.gs != null && Number.isFinite(ac.gs)) motionParts.push(fmtNum(ac.gs, " kt"));
+      if (ac.track != null && Number.isFinite(ac.track)) motionParts.push(fmtNum(ac.track, "°"));
+      if (ac.alt_baro != null) motionParts.push(fmtAlt(ac.alt_baro));
+      if (ac.vert_rate != null) {
+        let s = String(ac.vert_rate) + " fpm";
+        const vb = fmtVb(ac.vert_rate, ac.vert_rate_is_baro);
+        if (vb !== "—") s += " (" + vb + ")";
+        motionParts.push(s);
+      }
+    }
+    const motion = motionParts.length ? motionParts.join(" · ") : "—";
+
+    const rangeParts = [];
+    if (ac.range_nm != null && Number.isFinite(ac.range_nm)) rangeParts.push("rng " + ac.range_nm.toFixed(1));
+    if (ac.max_range_24h_nm != null && Number.isFinite(ac.max_range_24h_nm)) rangeParts.push("max " + ac.max_range_24h_nm.toFixed(1));
+    rangeParts.push(String(trlN) + " pts");
+    const rangeLine = rangeParts.join(" · ");
+
+    const q = [];
+    q.push("SS/n " + fmtSsNic(ac.pos_ss, ac.pos_nic_b));
+    if (ac.vel_subtype != null) q.push("ST " + ac.vel_subtype);
+    if (ac.nac_v != null) q.push("Nv " + ac.nac_v);
+    if (ac.geom_delta_ft != null) q.push("Δ " + ac.geom_delta_ft + " ft");
+    q.push("CA " + ac.emitter_category);
+    const qual = q.join(" · ");
+
+    const meta = [];
+    if (ac.seen != null) meta.push(ac.seen.toFixed(1) + " s");
+    if (ac.msg_count !== undefined) meta.push(ac.msg_count + " msgs");
+    if (ac.last_conf != null && Number.isFinite(ac.last_conf)) meta.push("conf " + ac.last_conf.toFixed(3));
+    const metaLine = meta.join(" · ");
+
+    let html = '<div class="ac-detail">';
+    html += "<h3>" + flightDisp + " <span class=\"muted\">" + hex + "</span></h3>";
+    html += '<div class="ac-line">' + pos + "</div>";
+    html += '<div class="ac-line">' + motion + "</div>";
+    html += '<div class="ac-line">' + rangeLine + "</div>";
+    html += '<div class="ac-line">' + qual + "</div>";
+    html += '<div class="ac-line muted" style="font-size:11px">' + metaLine + "</div>";
+    html += '<div class="ac-hint">Trail: older→newer hue; segment color = baro alt when set</div>';
+    html += "</div>";
+    acDetail.innerHTML = html;
+  }
+
+  function drawTrail(hex, ac) {
+    if (trailLayers[hex]) {
+      layers.removeLayer(trailLayers[hex]);
+      delete trailLayers[hex];
+    }
+    const pts = ac.trail || [];
+    if (pts.length < 2) return;
+    const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+    const g = L.layerGroup();
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      const cAlt = (b.alt != null) ? b.alt : a.alt;
+      const color = (cAlt != null) ? hslAlt(cAlt) : timeColor(b.t, t0, t1);
+      L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { color, weight: 3, opacity: 0.85 }).addTo(g);
+    }
+    g.on("click", (ev) => {
+      if (ev.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+    });
+    g.addTo(layers);
+    trailLayers[hex] = g;
+  }
+
+  function clearTrails() {
+    for (const k in trailLayers) {
+      layers.removeLayer(trailLayers[k]);
+    }
+    trailLayers = {};
+  }
+
+  /** Statute miles (labels say "mi") — matches 100/200/300 mile rings. */
+  function statMiToMeters(mi) { return mi * 1609.344; }
+  const EARTH_R_M = 6371000;
+  /** Latitude offset (deg) for distance R meters due north along meridian. */
+  function northLatOffsetDeg(Rm) {
+    return (Rm / EARTH_R_M) * (180 / Math.PI);
+  }
+
+  function updateRingOverlay() {
+    if (ringLayer) {
+      layers.removeLayer(ringLayer);
+      ringLayer = null;
+    }
+    if (!swRanges.checked) return;
+    if (!lastReceiver) return;
+    const g = L.layerGroup();
+    const ringsMi = [50, 100, 150, 200];
+    const ringColor = swLight.checked ? "#1f2d3d" : "#ffffff";
+    const ringLabelColor = swLight.checked ? "#1a2734" : "#ffffff";
+    const ringLabelShadow = swLight.checked
+      ? "0 0 2px rgba(255,255,255,0.95), 0 0 4px rgba(255,255,255,0.95)"
+      : "0 0 6px #000";
+    for (const mi of ringsMi) {
+      const Rm = statMiToMeters(mi);
+      const emph = Math.max(0, (250 - mi) / 200); // 50mi strongest, 200mi weakest
+      const strokeOpacity = (swLight.checked ? 0.22 : 0.12) + emph * (swLight.checked ? 0.45 : 0.35);
+      const strokeWeight = (swLight.checked ? 1.1 : 0.8) + emph * 1.2;
+      const labelOpacity = 0.35 + emph * 0.45;
+      L.circle([lastReceiver.lat, lastReceiver.lon], {
+        radius: Rm,
+        color: ringColor,
+        weight: strokeWeight,
+        opacity: strokeOpacity,
+        fillOpacity: 0.0,
+        interactive: false,
+      }).addTo(g);
+
+      // Label at top (north) of circle: point on meridian through receiver.
+      const latTop = lastReceiver.lat + northLatOffsetDeg(Rm);
+      L.marker([latTop, lastReceiver.lon], {
+        interactive: false,
+        icon: L.divIcon({
+          className: "ring-label",
+          html: '<div style="color:' + ringLabelColor + ';opacity:' + labelOpacity.toFixed(2) + ';font-size:12px;text-shadow:' + ringLabelShadow + ';">' + mi + ' mi</div>',
+          iconSize: [48, 18],
+          iconAnchor: [24, 18],
+        }),
+      }).addTo(g);
+    }
+    g.addTo(layers);
+    ringLayer = g;
+  }
+
+  swRanges.addEventListener("change", updateRingOverlay);
+
+  async function tick() {
+    try {
+      const r = await fetch("/aircraft.json", { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      const data = await r.json();
+      lastReceiver = data.receiver || null;
+      lastRingHits = Array.isArray(data.ring_hits) ? data.ring_hits : null;
+      lastRingTotal = (data.ring_total_ranged_hits != null) ? data.ring_total_ranged_hits : 0;
+      lastRingRates = Array.isArray(data.ring_rate_ewma_per_min) ? data.ring_rate_ewma_per_min : null;
+      updateRingOverlay();
+
+      let hintLine =
+        "now: " + (data.now != null ? data.now.toFixed(3) : "?") + " s  ·  " +
+        (data.aircraft || []).length + " ac" +
+        (lastRingHits ? ("  ·  hits<=50/100/150/200mi: " + lastRingHits.map(x => String(x)).join("/") ) : "") +
+        (lastRingRates ? ("  ·  ewma/min<=50/100/150/200mi: " + lastRingRates.map(x => (Number.isFinite(x) ? x.toFixed(2) : "0.00")).join("/") ) : "");
+      if (tileLoadFailed) {
+        hintLine += "  ·  map tiles: offline/blocked (allow HTTPS to tile servers)";
+      }
+      hint.textContent = hintLine;
+
+      const have = new Set();
+      for (const ac of data.aircraft || []) {
+        const hex = ac.hex;
+        if (!hex || ac.lat == null || ac.lon == null) continue;
+        have.add(hex);
+        const trk = ac.track;
+        if (!markers[hex]) {
+          const m = L.marker([ac.lat, ac.lon], { icon: arrowIcon(trk) });
+          m.on("click", (ev) => {
+            if (ev.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+            selectedHex = hex;
+            const cur = markers[hex].last;
+            clearTrails();
+            showPanel(cur);
+            drawTrail(hex, cur);
+          });
+          m.addTo(layers);
+          markers[hex] = { m, last: ac };
+        } else {
+          const o = markers[hex];
+          o.m.setLatLng([ac.lat, ac.lon]);
+          o.m.setIcon(arrowIcon(trk));
+          o.last = ac;
+        }
+      }
+
+      for (const k of Object.keys(markers)) {
+        if (!have.has(k)) {
+          layers.removeLayer(markers[k].m);
+          delete markers[k];
+          if (trailLayers[k]) {
+            layers.removeLayer(trailLayers[k]);
+            delete trailLayers[k];
+          }
+        }
+      }
+
+      if (selectedHex && !markers[selectedHex]) resetDetailPanel();
+      else if (selectedHex && markers[selectedHex]) {
+        const cur = markers[selectedHex].last;
+        showPanel(cur);
+        drawTrail(selectedHex, cur);
+      }
+
+      if (!didInitialView) {
+        if (data.receiver) {
+          map.setView([data.receiver.lat, data.receiver.lon], 9, { animate: false });
+          didInitialView = true;
+        } else {
+          const a = (data.aircraft || []).find(x => x.lat != null && x.lon != null);
+          if (a) {
+            map.setView([a.lat, a.lon], 7, { animate: false });
+            didInitialView = true;
+          }
+        }
+      }
+    } catch (e) {
+      hint.textContent = "fetch error: " + e;
+    }
+  }
+
+  map.on("click", () => {
+    resetDetailPanel();
+  });
+
+  map.setView([39.5, -98.35], 4);
+  tick();
+  setInterval(tick, 1000);
+})();
+  </script>
+</body>
+</html>
