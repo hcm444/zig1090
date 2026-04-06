@@ -25,6 +25,9 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("usb-1.0");
             exe.linkSystemLibrary("iconv");
         },
+        .openbsd => {
+            exe.linkSystemLibrary("usb-1.0");
+        },
         .windows => {
             exe.addLibraryPath(.{ .cwd_relative = "vcpkg/installed/x64-windows/lib" });
             exe.addIncludePath(.{ .cwd_relative = "vcpkg/installed/x64-windows/include" });
