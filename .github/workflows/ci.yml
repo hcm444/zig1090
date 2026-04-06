@@ -50,7 +50,24 @@ jobs:
 
       - name: Build
         run: zig build
+  build-openbsd:
+    name: Build (OpenBSD, pkg zig + rtl-sdr)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout zig1090
+        uses: actions/checkout@v4
 
+      - name: Build in OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            set -e
+            pkg_add -I rtl-sdr zig
+          run: |
+            set -e
+            zig version
+            zig build
   build-arch-linux:
     name: Build (archlinux, Zig repo version)
     runs-on: ubuntu-latest
