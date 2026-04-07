@@ -28,6 +28,7 @@ const Cli = struct {
     crc_two_bit_max_pairs: usize,
     overlap_rescan_samples: usize,
     phase_enhance_weight: f32,
+    conf_min_sigma: f32,
 };
 
 fn parseCli(argv: []const []const u8) Cli {
@@ -38,12 +39,13 @@ fn parseCli(argv: []const []const u8) Cli {
     var rlat: ?f64 = null;
     var rlon: ?f64 = null;
     var http_port: ?u16 = null;
-    var preamble_score_min: f32 = 2.0;
+    var preamble_score_min: f32 = 1.6;
     var timing_search_halfspan_samples: f64 = 0.20;
-    var rescue_conf_scale: f32 = 1.20;
+    var rescue_conf_scale: f32 = 1.00;
     var crc_two_bit_max_pairs: usize = 180;
     var overlap_rescan_samples: usize = 48;
     var phase_enhance_weight: f32 = 0.35;
+    var conf_min_sigma: f32 = 0.10;
 
     var i: usize = 1;
     while (i < argv.len) {
@@ -168,6 +170,18 @@ fn parseCli(argv: []const []const u8) Cli {
             i += 2;
             continue;
         }
+        if (std.mem.eql(u8, a, "--conf-min-sigma")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --conf-min-sigma <0.02..0.50>\n", .{});
+                std.posix.exit(2);
+            }
+            conf_min_sigma = std.fmt.parseFloat(f32, argv[i + 1]) catch {
+                std.debug.print("invalid --conf-min-sigma\n", .{});
+                std.posix.exit(2);
+            };
+            i += 2;
+            continue;
+        }
         const f = std.fmt.parseFloat(f64, a) catch {
             std.debug.print("unknown argument: {s}\n", .{a});
             std.posix.exit(2);
@@ -215,6 +229,10 @@ fn parseCli(argv: []const []const u8) Cli {
         std.debug.print("--phase-enhance-weight must be between 0.0 and 1.0\n", .{});
         std.posix.exit(2);
     }
+    if (conf_min_sigma < 0.02 or conf_min_sigma > 0.50) {
+        std.debug.print("--conf-min-sigma must be between 0.02 and 0.50\n", .{});
+        std.posix.exit(2);
+    }
 
     return .{
         .verbose = verbose,
@@ -230,6 +248,7 @@ fn parseCli(argv: []const []const u8) Cli {
         .crc_two_bit_max_pairs = crc_two_bit_max_pairs,
         .overlap_rescan_samples = overlap_rescan_samples,
         .phase_enhance_weight = phase_enhance_weight,
+        .conf_min_sigma = conf_min_sigma,
     };
 }
 const FRAME_N: usize = 8192;
@@ -501,12 +520,12 @@ pub fn main() !void {
                 cli.phase_enhance_weight,
             );
             if (cli.stats) decode_stats.full_decodes += 1;
-            if (conf < noise_std * 0.15) {
+            if (conf < noise_std * cli.conf_min_sigma) {
                 if (cli.stats) decode_stats.conf_rejected += 1;
                 i += 1;
                 continue;
             }
-            const rescue_threshold = (noise_std * 0.15) * cli.rescue_conf_scale;
+            const rescue_threshold = (noise_std * cli.conf_min_sigma) * cli.rescue_conf_scale;
             const offsets_rescue = [_]f64{
                 -timing_halfspan,
                 -timing_halfspan * 0.5,
