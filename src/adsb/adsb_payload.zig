@@ -17,6 +17,11 @@ pub fn me56FromBytes(msg: *const [14]u8) u56 {
         @as(u56, msg[10]);
 }
 
+/// True when DF17/18 extended squitter uses the 56-bit ME field for decoded content (callsign, position, velocity, etc.).
+pub fn typeCodeUsesMe(tc: u32) bool {
+    return (tc >= 1 and tc <= 18) or tc == 19 or tc == 28;
+}
+
 /// Reorder 13-bit field into hex Gillham layout (readsb `decodeID13Field`).
 pub fn decodeId13FieldGillham(id13: u32) u32 {
     const x = id13 & 0x1FFF;
@@ -520,4 +525,14 @@ pub fn printPayloadDecodes(
             }
         }
     }
+}
+
+test "typeCodeUsesMe" {
+    try std.testing.expect(typeCodeUsesMe(4));
+    try std.testing.expect(typeCodeUsesMe(11));
+    try std.testing.expect(typeCodeUsesMe(19));
+    try std.testing.expect(typeCodeUsesMe(28));
+    try std.testing.expect(!typeCodeUsesMe(0));
+    try std.testing.expect(!typeCodeUsesMe(29));
+    try std.testing.expect(!typeCodeUsesMe(31));
 }

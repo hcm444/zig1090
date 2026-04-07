@@ -1,10 +1,16 @@
 const std = @import("std");
 const aircraft_table = @import("aircraft_table.zig");
 
+/// Max age of cached `/aircraft.json` body before rebuilding (server-side only).
+pub const json_cache_ttl_ns: i128 = 150 * std.time.ns_per_ms;
+
 pub const Shared = struct {
     mutex: std.Thread.Mutex = .{},
     table: *aircraft_table.Table,
     center_mhz: f64,
+    /// `gpa`-owned body from last `/aircraft.json` build; reused while fresh.
+    json_cache: []u8 = &.{},
+    json_cache_at_ns: i128 = 0,
 };
 
 const index_html = @embedFile("web/index.html");
@@ -91,20 +97,35 @@ fn handleConnection(gpa: std.mem.Allocator, shared: *Shared, conn: std.net.Serve
             const now_ns = std.time.nanoTimestamp();
 
             shared.mutex.lock();
-            const snap = shared.table.snapshotForNet(arena.allocator(), now_ns, shared.center_mhz) catch |e| {
+            if (shared.json_cache.len > 0 and now_ns - shared.json_cache_at_ns < json_cache_ttl_ns) {
+                const cached = shared.json_cache;
                 shared.mutex.unlock();
-                return e;
-            };
-            shared.mutex.unlock();
+                try req.respond(cached, .{
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                        .{ .name = "cache-control", .value = "no-store" },
+                    },
+                });
+            } else {
+                const snap = shared.table.snapshotForNet(arena.allocator(), now_ns, shared.center_mhz) catch |e| {
+                    shared.mutex.unlock();
+                    return e;
+                };
+                shared.mutex.unlock();
 
-            const json_bytes = try std.json.Stringify.valueAlloc(gpa, snap, .{});
-            defer gpa.free(json_bytes);
-            try req.respond(json_bytes, .{
-                .extra_headers = &.{
-                    .{ .name = "content-type", .value = "application/json; charset=utf-8" },
-                    .{ .name = "cache-control", .value = "no-store" },
-                },
-            });
+                const json_bytes = try std.json.Stringify.valueAlloc(gpa, snap, .{});
+                shared.mutex.lock();
+                if (shared.json_cache.len > 0) gpa.free(shared.json_cache);
+                shared.json_cache = json_bytes;
+                shared.json_cache_at_ns = now_ns;
+                shared.mutex.unlock();
+                try req.respond(json_bytes, .{
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                        .{ .name = "cache-control", .value = "no-store" },
+                    },
+                });
+            }
         } else if (std.mem.eql(u8, path, "/static/leaflet/leaflet.css")) {
             try respondStatic(&req, static_leaflet_css, "text/css; charset=utf-8");
         } else if (std.mem.eql(u8, path, "/static/leaflet/leaflet.js")) {

@@ -237,6 +237,29 @@ pub fn decodeBitsManchesterBestOffsetPhaseEnhanced(
     return best_conf;
 }
 
+/// 2.0 Msps integer sample indices: same chipMetric as slow path, no interpolation.
+fn decodeBitsManchesterPhaseEnhancedIntSampleIndex(
+    energy: []const f32,
+    samples: []const C32,
+    start_i: usize,
+    bits: []u1,
+    phase_ref: ?C32,
+    phase_weight: f32,
+) f32 {
+    var confidence: f32 = 0.0;
+    for (bits, 0..) |_, b| {
+        const e0 = energy[start_i + b * 2];
+        const e1 = energy[start_i + b * 2 + 1];
+        const s0 = samples[start_i + b * 2];
+        const s1 = samples[start_i + b * 2 + 1];
+        const m0 = chipMetric(e0, s0, phase_ref, phase_weight);
+        const m1 = chipMetric(e1, s1, phase_ref, phase_weight);
+        bits[b] = if (m0 > m1) 1 else 0;
+        confidence += @abs(m0 - m1);
+    }
+    return confidence / @as(f32, @floatFromInt(bits.len));
+}
+
 /// Manchester decode using blended energy/coherent-phase chip metrics.
 pub fn decodeBitsManchesterPhaseEnhanced(
     energy: []const f32,
@@ -247,6 +270,24 @@ pub fn decodeBitsManchesterPhaseEnhanced(
     phase_ref: ?C32,
     phase_weight: f32,
 ) f32 {
+    if (phase_ref != null and phase_weight > 0.0 and bits.len > 0) {
+        if (@abs(samples_per_half_chip - 1.0) < 1e-12) {
+            const r = @round(data_start);
+            if (@abs(data_start - r) < 1e-7) {
+                const start_i: usize = @intFromFloat(r);
+                if (start_i + 2 * bits.len <= energy.len and start_i + 2 * bits.len <= samples.len) {
+                    return decodeBitsManchesterPhaseEnhancedIntSampleIndex(
+                        energy,
+                        samples,
+                        start_i,
+                        bits,
+                        phase_ref,
+                        phase_weight,
+                    );
+                }
+            }
+        }
+    }
     var confidence: f32 = 0.0;
     for (bits, 0..) |_, b| {
         const chip_a = data_start + @as(f64, @floatFromInt(b * 2)) * samples_per_half_chip;

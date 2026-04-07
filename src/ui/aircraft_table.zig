@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const adsb = @import("../adsb/adsb_payload.zig");
+const crc = @import("../mode_s/mode_s_crc.zig");
+const msdec = @import("../mode_s/mode_s_decode.zig");
 
 /// Column widths for the terminal table (header, rule line, and `render` data row must stay in sync).
 const term_table_widths = [_]u8{ 6, 8, 6, 2, 5, 5, 5, 5, 2, 10, 10, 4, 6, 3, 4, 2, 2, 5, 2, 5, 4, 1, 7 };
@@ -283,7 +285,12 @@ pub const Table = struct {
         };
     }
 
-    /// DF17/18 extended squitter, DF11 all-call (ICAO in AA), or no-op for other formats.
+    /// DF17/18 extended squitter; DF11 all-call (AA); DF 0/4/5 only **update** known ICAOs (see below).
+    ///
+    /// Address-parity short replies (DF 0/4/5) carry the ICAO in the CRC remainder, not in plaintext.
+    /// Without a readsb-style `icaoFilter`, creating new rows from those remainders floods the table with
+    /// noise addresses. We therefore only apply alt/squawk from DF 0/4/5 when that ICAO already exists
+    /// (usually from DF17/18 or DF11).
     pub fn updateFromModeSMessage(
         self: *Table,
         now_ns: i128,
@@ -299,21 +306,51 @@ pub const Table = struct {
             @memcpy(&msg14, msg[0..14]);
             return try self.updateFromEsMessage(now_ns, &msg14, conf, cpr_air, cpr_surf);
         }
-        if (bit_len != 56 or df != 11) return;
+        if (bit_len != 56) return;
 
-        const icao: u32 = (@as(u32, msg[1]) << 16) | (@as(u32, msg[2]) << 8) | @as(u32, msg[3]);
-        if (icao == 0) return;
+        if (df == 11) {
+            const icao: u32 = (@as(u32, msg[1]) << 16) | (@as(u32, msg[2]) << 8) | @as(u32, msg[3]);
+            if (icao == 0) return;
 
-        const gac = try self.map.getOrPut(icao);
-        if (!gac.found_existing) {
-            gac.value_ptr.* = .{ .icao = icao };
-            try self.keys.append(self.alloc, icao);
-            self.keys_dirty = true;
+            const gac = try self.map.getOrPut(icao);
+            if (!gac.found_existing) {
+                gac.value_ptr.* = .{ .icao = icao };
+                try self.keys.append(self.alloc, icao);
+                self.keys_dirty = true;
+            }
+            const ac = gac.value_ptr;
+            ac.msg_count += 1;
+            ac.last_seen_ns = now_ns;
+            ac.last_conf = conf;
+            return;
         }
-        const ac = gac.value_ptr;
-        ac.msg_count += 1;
-        ac.last_seen_ns = now_ns;
-        ac.last_conf = conf;
+
+        if (df == 0 or df == 4 or df == 5) {
+            var msg7: [7]u8 = undefined;
+            @memcpy(&msg7, msg[0..7]);
+            const icao: u32 = @as(u32, crc.modesChecksum56(&msg7));
+            if (icao == 0) return;
+
+            const ac = self.map.getPtr(icao) orelse return;
+
+            ac.msg_count += 1;
+            ac.last_seen_ns = now_ns;
+            ac.last_conf = conf;
+
+            if (df == 0 or df == 4) {
+                const ac13 = msdec.bitsInclusive1(msg, 20, 32);
+                if (adsb.decodeAc13Feet(ac13)) |alt| {
+                    ac.baro_alt_ft = alt;
+                    ac.baro_alt_is_q = (ac13 & 0x0010) != 0;
+                }
+            }
+            if (df == 5) {
+                const id13 = msdec.bitsInclusive1(msg, 20, 32);
+                if (adsb.squawkDecimalFromId13(id13)) |sq| {
+                    ac.squawk = sq;
+                }
+            }
+        }
     }
 
     pub fn updateFromEsMessage(
@@ -343,7 +380,7 @@ pub const Table = struct {
         const ac = gac.value_ptr;
 
         const tc = (msg[4] >> 3) & 0x1f;
-        const me = adsb.me56FromBytes(msg);
+        const me: u56 = if (adsb.typeCodeUsesMe(tc)) adsb.me56FromBytes(msg) else 0;
 
         ac.emitter_category = msg[0] & 0x07;
         ac.msg_count += 1;
@@ -486,7 +523,8 @@ pub const Table = struct {
 
             // NOTE: widths in Zig are minimum widths; precision caps max width.
             // The `.N` precisions below keep the table columns aligned even if any field is longer.
-            try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
+            var row_buf: [512]u8 = undefined;
+            const row = std.fmt.bufPrint(&row_buf, "{x:0>6} {s:<8.8} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
                 icao,
                 flight_disp,
                 alt_s,
@@ -510,7 +548,35 @@ pub const Table = struct {
                 seen_s,
                 if (ac.on_ground) "G" else " ",
                 ac.last_conf,
-            });
+            }) catch {
+                try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
+                    icao,
+                    flight_disp,
+                    alt_s,
+                    ac_enc_s,
+                    sqk_s,
+                    gs_s,
+                    trk_s,
+                    vr_s,
+                    vb_s,
+                    lat_s,
+                    lon_s,
+                    rng_s,
+                    max_rng_s,
+                    trl_s,
+                    ss_nb_s,
+                    st_s,
+                    nv_s,
+                    gd_s,
+                    ac.emitter_category,
+                    ac.msg_count,
+                    seen_s,
+                    if (ac.on_ground) "G" else " ",
+                    ac.last_conf,
+                });
+                continue;
+            };
+            try w.writeAll(row);
         }
     }
 

@@ -14,6 +14,8 @@ const DEFAULT_SAMPLE_RATE: f64 = 2.0e6;
 
 const Cli = struct {
     verbose: bool,
+    /// Print periodic decode counters to stderr (does not affect demod).
+    stats: bool,
     center_hz: f64,
     sample_rate_hz: f64,
     receiver_lat: ?f64,
@@ -30,6 +32,7 @@ const Cli = struct {
 
 fn parseCli(argv: []const []const u8) Cli {
     var verbose = false;
+    var stats = false;
     var center: ?f64 = null;
     var rate: ?f64 = null;
     var rlat: ?f64 = null;
@@ -47,6 +50,11 @@ fn parseCli(argv: []const []const u8) Cli {
         const a = argv[i];
         if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
             verbose = true;
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--stats")) {
+            stats = true;
             i += 1;
             continue;
         }
@@ -210,6 +218,7 @@ fn parseCli(argv: []const []const u8) Cli {
 
     return .{
         .verbose = verbose,
+        .stats = stats,
         .center_hz = center orelse DEFAULT_CENTER_HZ,
         .sample_rate_hz = rate orelse DEFAULT_SAMPLE_RATE,
         .receiver_lat = rlat,
@@ -262,12 +271,30 @@ const MIN_SAMPLE_RATE_HZ: f64 = 1.8e6;
 
 fn fillEnergy(samples: []const C32, energy: []f32) void {
     std.debug.assert(samples.len == energy.len);
-    for (samples, 0..) |s, i| {
-        const re: f32 = s.re;
-        const im: f32 = s.im;
-        energy[i] = re * re + im * im;
+    var i: usize = 0;
+    while (i + 8 <= samples.len) : (i += 8) {
+        inline for (0..8) |k| {
+            const s = samples[i + k];
+            energy[i + k] = s.re * s.re + s.im * s.im;
+        }
+    }
+    while (i < samples.len) : (i += 1) {
+        const s = samples[i];
+        energy[i] = s.re * s.re + s.im * s.im;
     }
 }
+
+const DecodeStats = struct {
+    preambles_passed: u64 = 0,
+    full_decodes: u64 = 0,
+    conf_rejected: u64 = 0,
+    accepted_56: u64 = 0,
+    accepted_112: u64 = 0,
+    rescue_redecodes: u64 = 0,
+    crc112_no_repair: u64 = 0,
+    crc112_1bit: u64 = 0,
+    crc112_2bit: u64 = 0,
+};
 
 const NoiseEstimator = struct {
     mean: f32 = 0.0,
@@ -381,7 +408,12 @@ pub fn main() !void {
     var web_sh_ptr: ?*web.Shared = null;
     var http_thread: ?std.Thread = null;
     if (cli.http_port) |hp| {
-        web_sh = .{ .table = &ac_table, .center_mhz = center_hz / 1e6 };
+        web_sh = .{
+            .table = &ac_table,
+            .center_mhz = center_hz / 1e6,
+            .json_cache = &.{},
+            .json_cache_at_ns = 0,
+        };
         web_sh_ptr = &web_sh;
         http_thread = try web.spawnListener(&web_sh, hp);
     }
@@ -393,6 +425,9 @@ pub fn main() !void {
     var last_accept_len: usize = 0;
     var last_accept_bits: usize = 0;
     var last_accept_hash: u64 = 0;
+
+    var decode_stats = DecodeStats{};
+    var last_stats_print_ns: i128 = 0;
 
     while (true) {
         iq.wait(FRAME_N, 200 * std.time.ns_per_ms) catch |err| switch (err) {
@@ -416,6 +451,7 @@ pub fn main() !void {
                 i += 1;
                 continue;
             }
+            if (cli.stats) decode_stats.preambles_passed += 1;
             if (last_accept_len != 0) {
                 const overlap_end = last_accept_i + last_accept_len;
                 if (i > last_accept_i and i < overlap_end and i > last_accept_i + cli.overlap_rescan_samples) {
@@ -464,7 +500,9 @@ pub fn main() !void {
                 phase_ref,
                 cli.phase_enhance_weight,
             );
+            if (cli.stats) decode_stats.full_decodes += 1;
             if (conf < noise_std * 0.15) {
+                if (cli.stats) decode_stats.conf_rejected += 1;
                 i += 1;
                 continue;
             }
@@ -480,8 +518,9 @@ pub fn main() !void {
             if (bit_len == 56) {
                 var msg7: [7]u8 = undefined;
                 demod.bitsToBytes(bits[0..56], &msg7);
-                var crc_ok = crc.acceptOrFixSingleBit56(&msg7);
-                if (!crc_ok and conf >= rescue_threshold) {
+                var crc_ok = crc.accept56Short(df, &msg7, true);
+                if (!crc_ok and df == 11 and conf >= rescue_threshold) {
+                    if (cli.stats) decode_stats.rescue_redecodes += 1;
                     conf = demod.decodeBitsManchesterBestOffsetPhaseEnhanced(
                         &energy,
                         frame,
@@ -494,7 +533,7 @@ pub fn main() !void {
                         cli.phase_enhance_weight,
                     );
                     demod.bitsToBytes(bits[0..56], &msg7);
-                    crc_ok = crc.acceptOrFixTwoBit56(&msg7, cli.crc_two_bit_max_pairs);
+                    crc_ok = crc.accept56Short(df, &msg7, true);
                 }
                 if (!crc_ok) {
                     i += 1;
@@ -507,13 +546,21 @@ pub fn main() !void {
                 }
                 const conf64: f64 = @as(f64, conf);
                 try updateTableLocked(web_sh_ptr, &ac_table, now_ns, msg7[0..], 56, df, conf64, &cpr_map, &cpr_surface_map);
+                if (cli.stats) decode_stats.accepted_56 += 1;
                 if (verbose) msdec.printVerbose(&msg7, 56, df, conf64);
                 last_accept_hash = msg_hash;
             } else {
                 var msg14: [14]u8 = undefined;
                 demod.bitsToBytes(bits[0..112], &msg14);
-                var crc_ok = crc.acceptOrFixSingleBit(&msg14);
+                const crc_before_ok = crc.modesChecksum(&msg14) == 0;
+                var crc_ok = crc_before_ok;
+                if (!crc_ok) {
+                    crc_ok = crc.acceptOrFixSingleBit(&msg14);
+                    if (crc_ok and cli.stats) decode_stats.crc112_1bit += 1;
+                }
+                if (crc_before_ok and cli.stats) decode_stats.crc112_no_repair += 1;
                 if (!crc_ok and conf >= rescue_threshold) {
+                    if (cli.stats) decode_stats.rescue_redecodes += 1;
                     conf = demod.decodeBitsManchesterBestOffsetPhaseEnhanced(
                         &energy,
                         frame,
@@ -527,6 +574,7 @@ pub fn main() !void {
                     );
                     demod.bitsToBytes(bits[0..112], &msg14);
                     crc_ok = crc.acceptOrFixTwoBit(&msg14, cli.crc_two_bit_max_pairs);
+                    if (crc_ok and cli.stats) decode_stats.crc112_2bit += 1;
                 }
                 if (!crc_ok) {
                     i += 1;
@@ -544,6 +592,7 @@ pub fn main() !void {
                 }
                 const conf64: f64 = @as(f64, conf);
                 try updateTableLocked(web_sh_ptr, &ac_table, now_ns, msg14[0..], 112, df, conf64, &cpr_map, &cpr_surface_map);
+                if (cli.stats) decode_stats.accepted_112 += 1;
                 if (verbose) msdec.printVerbose(&msg14, 112, df, conf64);
                 last_accept_hash = msg_hash;
             }
@@ -564,5 +613,26 @@ pub fn main() !void {
         }
 
         iq.update(FRAME_N);
+
+        if (cli.stats) {
+            const stats_now = std.time.nanoTimestamp();
+            if (stats_now - last_stats_print_ns >= 5 * std.time.ns_per_s) {
+                last_stats_print_ns = stats_now;
+                std.debug.print(
+                    "zig1090 stats: preambles={d} full_decodes={d} conf_rej={d} acc56={d} acc112={d} rescue={d} crc112_ok={d} crc112_1b={d} crc112_2b={d}\n",
+                    .{
+                        decode_stats.preambles_passed,
+                        decode_stats.full_decodes,
+                        decode_stats.conf_rejected,
+                        decode_stats.accepted_56,
+                        decode_stats.accepted_112,
+                        decode_stats.rescue_redecodes,
+                        decode_stats.crc112_no_repair,
+                        decode_stats.crc112_1bit,
+                        decode_stats.crc112_2bit,
+                    },
+                );
+            }
+        }
     }
 }
