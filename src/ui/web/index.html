@@ -185,7 +185,13 @@
     } else {
       if (ac.gs != null && Number.isFinite(ac.gs)) motionParts.push(fmtNum(ac.gs, " kt"));
       if (ac.track != null && Number.isFinite(ac.track)) motionParts.push(fmtNum(ac.track, "°"));
-      if (ac.alt_baro != null) motionParts.push(fmtAlt(ac.alt_baro));
+      if (ac.alt_baro != null) {
+        let altStr = fmtAlt(ac.alt_baro);
+        if (ac.baro_alt_is_q === true) altStr += " (Q 25 ft)";
+        else if (ac.baro_alt_is_q === false) altStr += " (Mode C 100 ft)";
+        motionParts.push(altStr);
+      }
+      if (ac.squawk != null) motionParts.push("sq " + String(ac.squawk).padStart(4, "0"));
       if (ac.vert_rate != null) {
         let s = String(ac.vert_rate) + " fpm";
         const vb = fmtVb(ac.vert_rate, ac.vert_rate_is_baro);

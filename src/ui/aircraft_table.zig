@@ -3,6 +3,12 @@
 const std = @import("std");
 const adsb = @import("../adsb/adsb_payload.zig");
 
+/// Column widths for the terminal table (header, rule line, and `render` data row must stay in sync).
+const term_table_widths = [_]u8{ 6, 8, 6, 2, 5, 5, 5, 5, 2, 10, 10, 4, 6, 3, 4, 2, 2, 5, 2, 5, 4, 1, 7 };
+comptime {
+    std.debug.assert(term_table_widths.len == 23);
+}
+
 const TRAIL_RETENTION_NS: i128 = 24 * 60 * 60 * std.time.ns_per_s;
 const TRAIL_SAMPLE_MIN_NS: i128 = 10 * std.time.ns_per_s;
 const TRAIL_MOVE_MIN_NM: f64 = 0.05;
@@ -40,6 +46,10 @@ pub const NetAircraft = struct {
     lon: ?f64,
     track: ?f32,
     alt_baro: ?i32,
+    /// True = 25 ft steps (Q); false = Gillham Mode C (100 ft) when `alt_baro` set from airborne position.
+    baro_alt_is_q: ?bool,
+    /// Mode A squawk 0000–7777 (ADS-B TC 28 or future Mode S identity).
+    squawk: ?u16,
     gs: ?f32,
     vert_rate: ?i32,
     /// Matches terminal `Vb`: baro (B) vs geom (G) vertical rate source when known.
@@ -86,6 +96,10 @@ pub const Aircraft = struct {
     /// DF17/18 emitter category (byte 0, low 3 bits); updated on every ES message.
     emitter_category: u8 = 0,
     baro_alt_ft: ?i32 = null,
+    /// Set from TC 9–18 AC12 Q bit when baro alt updated from airborne position.
+    baro_alt_is_q: ?bool = null,
+    /// Mode A code (squawk), 4-digit 0000–7777.
+    squawk: ?u16 = null,
     ground_speed_kt: ?f32 = null,
     track_deg: ?f32 = null,
     vert_rate_fpm: ?i32 = null,
@@ -221,6 +235,8 @@ pub const Table = struct {
                 .lon = ac.lon,
                 .track = ac.track_deg,
                 .alt_baro = ac.baro_alt_ft,
+                .baro_alt_is_q = ac.baro_alt_is_q,
+                .squawk = ac.squawk,
                 .gs = ac.ground_speed_kt,
                 .vert_rate = ac.vert_rate_fpm,
                 .vert_rate_is_baro = ac.vert_rate_is_baro,
@@ -340,48 +356,62 @@ pub const Table = struct {
             ac.copyCallsignFromBuf(&buf);
         }
 
-        if (adsb.parseSurfacePosition(me, tc)) |sp| {
-            ac.on_ground = true;
-            ac.pos_ss = null;
-            ac.pos_nic_b = null;
-            if (sp.movement > 0 and sp.movement < 125) {
-                ac.ground_speed_kt = adsb.decodeMovementFieldV0(sp.movement);
-            }
-            if (sp.heading_valid) {
-                ac.track_deg = sp.heading_deg;
-            }
-            if (adsb.updateCprSurfaceAndMaybeDecode(cpr_surf_st, sp, sp.f_odd, now_ns, self.receiver_lat, self.receiver_lon)) |fix| {
-                ac.lat = fix.lat;
-                ac.lon = fix.lon;
-                try self.maybeAppendTrailPoint(ac, now_ns, fix.lat, fix.lon);
-            }
-        }
-
-        if (adsb.parseAirbornePosition(me, tc)) |pos| {
-            ac.on_ground = false;
-            ac.pos_ss = @intCast(pos.ss);
-            ac.pos_nic_b = @intCast(pos.nic_b);
-            if (adsb.decodeAc12Feet(pos.alt12)) |alt| {
-                ac.baro_alt_ft = alt;
-            }
-            if (adsb.updateCprAndMaybeDecode(cpr_state, pos, pos.f_odd, now_ns, self.receiver_lat, self.receiver_lon)) |fix| {
-                ac.lat = fix.lat;
-                ac.lon = fix.lon;
-                try self.maybeAppendTrailPoint(ac, now_ns, fix.lat, fix.lon);
+        if (tc >= 5 and tc <= 8) {
+            if (adsb.parseSurfacePosition(me, tc)) |sp| {
+                ac.on_ground = true;
+                ac.baro_alt_is_q = null;
+                ac.pos_ss = null;
+                ac.pos_nic_b = null;
+                if (sp.movement > 0 and sp.movement < 125) {
+                    ac.ground_speed_kt = adsb.decodeMovementFieldV0(sp.movement);
+                }
+                if (sp.heading_valid) {
+                    ac.track_deg = sp.heading_deg;
+                }
+                if (adsb.updateCprSurfaceAndMaybeDecode(cpr_surf_st, sp, sp.f_odd, now_ns, self.receiver_lat, self.receiver_lon)) |fix| {
+                    ac.lat = fix.lat;
+                    ac.lon = fix.lon;
+                    try self.maybeAppendTrailPoint(ac, now_ns, fix.lat, fix.lon);
+                }
             }
         }
 
-        if (adsb.parseVelocity(me, tc)) |v| {
-            ac.vel_subtype = @intCast(v.st);
-            ac.nac_v = @intCast(v.nac_v);
-            ac.geom_delta_ft = v.geom_delta_ft;
-            if (v.vert_rate_fpm) |r| {
-                ac.vert_rate_fpm = r;
-                ac.vert_rate_is_baro = v.vert_rate_is_baro;
+        if (tc >= 9 and tc <= 18) {
+            if (adsb.parseAirbornePosition(me, tc)) |pos| {
+                ac.on_ground = false;
+                ac.pos_ss = @intCast(pos.ss);
+                ac.pos_nic_b = @intCast(pos.nic_b);
+                ac.baro_alt_is_q = (pos.alt12 & 0x10) != 0;
+                if (adsb.decodeAc12Feet(pos.alt12)) |alt| {
+                    ac.baro_alt_ft = alt;
+                }
+                if (adsb.updateCprAndMaybeDecode(cpr_state, pos, pos.f_odd, now_ns, self.receiver_lat, self.receiver_lon)) |fix| {
+                    ac.lat = fix.lat;
+                    ac.lon = fix.lon;
+                    try self.maybeAppendTrailPoint(ac, now_ns, fix.lat, fix.lon);
+                }
             }
-            if (v.st == 1 or v.st == 2 or v.st == 3 or v.st == 4) {
-                ac.ground_speed_kt = v.ground_speed_kt;
-                ac.track_deg = v.track_deg;
+        }
+
+        if (tc == 28) {
+            if (adsb.parseTc28EmergencySquawkMe(me)) |sq| {
+                ac.squawk = sq;
+            }
+        }
+
+        if (tc == 19) {
+            if (adsb.parseVelocity(me, tc)) |v| {
+                ac.vel_subtype = @intCast(v.st);
+                ac.nac_v = @intCast(v.nac_v);
+                ac.geom_delta_ft = v.geom_delta_ft;
+                if (v.vert_rate_fpm) |r| {
+                    ac.vert_rate_fpm = r;
+                    ac.vert_rate_is_baro = v.vert_rate_is_baro;
+                }
+                if (v.st == 1 or v.st == 2 or v.st == 3 or v.st == 4) {
+                    ac.ground_speed_kt = v.ground_speed_kt;
+                    ac.track_deg = v.track_deg;
+                }
             }
         }
     }
@@ -400,13 +430,30 @@ pub const Table = struct {
                 .{center_mhz},
             );
         }
-        try w.writeAll("ICAO   Flight    Alt    GS    Trk   Vrate Vb Lat        Lon         Rng  Max24h Trl SS/n ST Nv  Gd    CA Msgs Seen G Conf\n");
-        try w.writeAll("------ -------- ------ ----- ----- ----- -- ---------- ---------- ---- ------ --- ---- -- -- ----- -- ---- ---- - ----\n");
+        // Same layout as each data row: `{x:0>6} {s:<8.8} … {d:>7.3}` (see `term_table_widths`).
+        try writeTermTableHeader(w);
+        try writeTermTableRule(w);
 
         if (self.keys_dirty) {
             std.mem.sort(u32, self.keys.items, {}, std.sort.asc(u32));
             self.keys_dirty = false;
         }
+
+        var flight_buf: [9]u8 = undefined;
+        var b_alt: [16]u8 = undefined;
+        var b_sqk: [8]u8 = undefined;
+        var b_gs: [16]u8 = undefined;
+        var b_trk: [16]u8 = undefined;
+        var b_vr: [16]u8 = undefined;
+        var b_lat: [16]u8 = undefined;
+        var b_lon: [16]u8 = undefined;
+        var b_gd: [16]u8 = undefined;
+        var b_ssnb: [8]u8 = undefined;
+        var b_st: [8]u8 = undefined;
+        var b_nv: [8]u8 = undefined;
+        var b_rng: [16]u8 = undefined;
+        var b_max_rng: [16]u8 = undefined;
+        var b_trl: [8]u8 = undefined;
 
         for (self.keys.items) |icao| {
             const ac = self.map.getPtr(icao) orelse continue;
@@ -414,26 +461,13 @@ pub const Table = struct {
             if (seen_s > 120.0) continue;
             self.pruneTrail(ac, now_ns);
 
-            var flight_buf: [9]u8 = undefined;
             @memcpy(flight_buf[0..8], ac.callsign[0..8]);
             flight_buf[8] = 0;
             const fl = trimTrailingSpaces(flight_buf[0..ac.callsign_len]);
 
-            var b_alt: [16]u8 = undefined;
-            var b_gs: [16]u8 = undefined;
-            var b_trk: [16]u8 = undefined;
-            var b_vr: [16]u8 = undefined;
-            var b_lat: [16]u8 = undefined;
-            var b_lon: [16]u8 = undefined;
-            var b_gd: [16]u8 = undefined;
-            var b_ssnb: [8]u8 = undefined;
-            var b_st: [8]u8 = undefined;
-            var b_nv: [8]u8 = undefined;
-            var b_rng: [16]u8 = undefined;
-            var b_max_rng: [16]u8 = undefined;
-            var b_trl: [8]u8 = undefined;
-
             const alt_s = fmtOptI32(&b_alt, ac.baro_alt_ft);
+            const ac_enc_s = baroAltEncodingStr(ac.baro_alt_is_q);
+            const sqk_s = fmtSquawk(&b_sqk, ac.squawk);
             const gs_s = fmtOptF32(&b_gs, ac.ground_speed_kt, "{d:.0}");
             const trk_s = fmtOptF32(&b_trk, ac.track_deg, "{d:.0}");
             const vr_s = fmtOptI32(&b_vr, ac.vert_rate_fpm);
@@ -452,10 +486,12 @@ pub const Table = struct {
 
             // NOTE: widths in Zig are minimum widths; precision caps max width.
             // The `.N` precisions below keep the table columns aligned even if any field is longer.
-            try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:5} {d:4.0} {s:1.1} {d:.3}\n", .{
+            try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
                 icao,
                 flight_disp,
                 alt_s,
+                ac_enc_s,
+                sqk_s,
                 gs_s,
                 trk_s,
                 vr_s,
@@ -582,10 +618,46 @@ pub const Table = struct {
     }
 };
 
+fn writeTermTableHeader(w: *std.Io.Writer) !void {
+    try w.print(
+        "{s:>6} {s:<8} {s:>6} {s:>2} {s:>5} {s:>5} {s:>5} {s:>5} {s:>2} {s:>10} {s:>10} {s:>4} {s:>6} {s:>3} {s:>4} {s:>2} {s:>2} {s:>5} {s:>2} {s:>5} {s:>4} {s:>1} {s:>7}\n",
+        .{ "ICAO", "Flight", "Alt", "AC", "Sqk", "GS", "Trk", "Vrate", "Vb", "Lat", "Lon", "Rng", "Max24h", "Trl", "SS/n", "ST", "Nv", "Gd", "CA", "Msgs", "Seen", "G", "Conf" },
+    );
+}
+
+fn writeTermTableRule(w: *std.Io.Writer) !void {
+    // One contiguous line: avoid ~100+ tiny `writeAll("-")` calls per refresh (was measurable vs. demod loop).
+    var buf: [140]u8 = undefined;
+    var pos: usize = 0;
+    for (term_table_widths, 0..) |wd, i| {
+        if (i != 0) {
+            buf[pos] = ' ';
+            pos += 1;
+        }
+        @memset(buf[pos..][0..wd], '-');
+        pos += wd;
+    }
+    buf[pos] = '\n';
+    pos += 1;
+    try w.writeAll(buf[0..pos]);
+}
+
 fn trimTrailingSpaces(s: []const u8) []const u8 {
     var end: usize = s.len;
     while (end > 0 and s[end - 1] == ' ') end -= 1;
     return s[0..end];
+}
+
+fn baroAltEncodingStr(is_q: ?bool) []const u8 {
+    if (is_q) |q| return if (q) "Q" else "M";
+    return "-";
+}
+
+fn fmtSquawk(buf: []u8, v: ?u16) []const u8 {
+    if (v) |x| {
+        return std.fmt.bufPrint(buf, "{d:0>4}", .{x}) catch return "----";
+    }
+    return "----";
 }
 
 fn fmtOptI32(buf: []u8, v: ?i32) []const u8 {

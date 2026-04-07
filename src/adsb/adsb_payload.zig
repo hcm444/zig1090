@@ -18,7 +18,7 @@ pub fn me56FromBytes(msg: *const [14]u8) u56 {
 }
 
 /// Reorder 13-bit field into hex Gillham layout (readsb `decodeID13Field`).
-fn decodeId13FieldGillham(id13: u32) u32 {
+pub fn decodeId13FieldGillham(id13: u32) u32 {
     const x = id13 & 0x1FFF;
     var g: u32 = 0;
     if ((x & 0x1000) != 0) g |= 0x0010;
@@ -70,6 +70,26 @@ fn modeAToModeC(mode_a: u32) ?i32 {
     const n = (@as(i32, @intCast(five_hundreds)) * 5) + @as(i32, @intCast(one_hundreds)) - 13;
     if (n < -12) return null;
     return n;
+}
+
+/// 13-bit identity field (TC 28 squawk, DF 5, etc.) → 4-digit squawk 0000–7777 (octal digits).
+pub fn squawkDecimalFromId13(id13: u32) ?u16 {
+    if (id13 == 0) return null;
+    const g = decodeId13FieldGillham(id13 & 0x1FFF);
+    const a = (g >> 12) & 7;
+    const b = (g >> 8) & 7;
+    const c = (g >> 4) & 7;
+    const d = g & 7;
+    const v: u32 = @as(u32, a) * 1000 + @as(u32, b) * 100 + @as(u32, c) * 10 + @as(u32, d);
+    return @intCast(v);
+}
+
+/// TC 28 subtype 1 squawk; caller must only invoke when `tc == 28` (avoids redundant checks on hot path).
+pub fn parseTc28EmergencySquawkMe(me: u56) ?u16 {
+    const mesub = (me >> 48) & 0x7;
+    if (mesub != 1) return null;
+    const id13: u32 = @truncate((me >> 32) & 0x1FFF);
+    return squawkDecimalFromId13(id13);
 }
 
 /// 12-bit AC altitude (feet): Q=1 → 25 ft steps; Q=0 → Gillham Mode C (100 ft); else null.
@@ -486,5 +506,18 @@ pub fn printPayloadDecodes(
             std.debug.print(" geom-baro={d} ft", .{d});
         }
         std.debug.print("\n", .{});
+    }
+
+    if (tc == 28) {
+        const mesub = (me >> 48) & 0x7;
+        if (mesub == 1) {
+            const em = (me >> 45) & 0x7;
+            const id13: u32 = @truncate((me >> 32) & 0x1FFF);
+            if (squawkDecimalFromId13(id13)) |sq| {
+                std.debug.print("  TC28 status: emergency={d} squawk={d:0>4}\n", .{ em, sq });
+            } else {
+                std.debug.print("  TC28 status: emergency={d} (squawk field 0)\n", .{em});
+            }
+        }
     }
 }

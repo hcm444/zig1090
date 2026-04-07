@@ -228,6 +228,36 @@ comptime {
     std.debug.assert(FRAME_N == rtl_iq.frame_len);
 }
 const TABLE_REFRESH_NS: i128 = 250 * std.time.ns_per_ms;
+
+fn updateTableLocked(
+    web_sh_ptr: ?*web.Shared,
+    table: *aircraft_table.Table,
+    now_ns: i128,
+    msg: []const u8,
+    bit_len: usize,
+    df: u32,
+    conf64: f64,
+    cpr_air: *std.AutoHashMap(u32, adsb.CprAirborneState),
+    cpr_surf: *std.AutoHashMap(u32, adsb.CprSurfaceState),
+) !void {
+    const m = web_sh_ptr;
+    if (m) |ws| ws.mutex.lock();
+    defer if (m) |ws| ws.mutex.unlock();
+    try table.updateFromModeSMessage(now_ns, msg, bit_len, df, conf64, cpr_air, cpr_surf);
+}
+
+fn renderTableLocked(
+    web_sh_ptr: ?*web.Shared,
+    table: *aircraft_table.Table,
+    w: *std.Io.Writer,
+    now_ns: i128,
+    center_mhz: f64,
+) !void {
+    const m = web_sh_ptr;
+    if (m) |ws| ws.mutex.lock();
+    defer if (m) |ws| ws.mutex.unlock();
+    try table.render(w, now_ns, center_mhz);
+}
 const MIN_SAMPLE_RATE_HZ: f64 = 1.8e6;
 
 fn fillEnergy(samples: []const C32, energy: []f32) void {
@@ -476,13 +506,7 @@ pub fn main() !void {
                     continue;
                 }
                 const conf64: f64 = @as(f64, conf);
-                if (web_sh_ptr) |ws| {
-                    ws.mutex.lock();
-                    defer ws.mutex.unlock();
-                    try ac_table.updateFromModeSMessage(now_ns, &msg7, 56, df, conf64, &cpr_map, &cpr_surface_map);
-                } else {
-                    try ac_table.updateFromModeSMessage(now_ns, &msg7, 56, df, conf64, &cpr_map, &cpr_surface_map);
-                }
+                try updateTableLocked(web_sh_ptr, &ac_table, now_ns, msg7[0..], 56, df, conf64, &cpr_map, &cpr_surface_map);
                 if (verbose) msdec.printVerbose(&msg7, 56, df, conf64);
                 last_accept_hash = msg_hash;
             } else {
@@ -519,13 +543,7 @@ pub fn main() !void {
                     continue;
                 }
                 const conf64: f64 = @as(f64, conf);
-                if (web_sh_ptr) |ws| {
-                    ws.mutex.lock();
-                    defer ws.mutex.unlock();
-                    try ac_table.updateFromModeSMessage(now_ns, &msg14, 112, df, conf64, &cpr_map, &cpr_surface_map);
-                } else {
-                    try ac_table.updateFromModeSMessage(now_ns, &msg14, 112, df, conf64, &cpr_map, &cpr_surface_map);
-                }
+                try updateTableLocked(web_sh_ptr, &ac_table, now_ns, msg14[0..], 112, df, conf64, &cpr_map, &cpr_surface_map);
                 if (verbose) msdec.printVerbose(&msg14, 112, df, conf64);
                 last_accept_hash = msg_hash;
             }
@@ -541,13 +559,7 @@ pub fn main() !void {
         if (!verbose and now_ns - last_table_draw_ns >= TABLE_REFRESH_NS) {
             last_table_draw_ns = now_ns;
             var stdout_wr = std.fs.File.stdout().writer(&stdout_buf);
-            if (web_sh_ptr) |ws| {
-                ws.mutex.lock();
-                defer ws.mutex.unlock();
-                try ac_table.render(&stdout_wr.interface, now_ns, center_hz / 1e6);
-            } else {
-                try ac_table.render(&stdout_wr.interface, now_ns, center_hz / 1e6);
-            }
+            try renderTableLocked(web_sh_ptr, &ac_table, &stdout_wr.interface, now_ns, center_hz / 1e6);
             try stdout_wr.interface.flush();
         }
 
