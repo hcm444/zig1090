@@ -237,13 +237,28 @@ pub const Table = struct {
         var bin_best_pos: [COVERAGE_BINS]ReceiverPos = undefined;
         for (self.keys.items) |icao| {
             const ac_ptr = self.map.getPtr(icao) orelse continue;
+            // Keep 24h rolling coverage independent of "currently seen" aircraft.
+            self.pruneTrail(ac_ptr, now_ns);
             const ac = ac_ptr.*;
-            const seen_s: f64 = @as(f64, @floatFromInt(now_ns - ac.last_seen_ns)) / 1e9;
-            if (seen_s > 120.0) continue;
 
             if (ac.max_range_24h_nm) |r| {
                 if (coverage_nm == null or r > coverage_nm.?) coverage_nm = r;
             }
+            if (self.receiver_lat != null and self.receiver_lon != null) {
+                for (ac.trail.items) |p| {
+                    if (p.range_nm) |r| {
+                        const b = bearingDeg(self.receiver_lat.?, self.receiver_lon.?, p.lat, p.lon);
+                        const bin = @min(COVERAGE_BINS - 1, @as(usize, @intFromFloat(@floor(b / (360.0 / @as(f64, COVERAGE_BINS))))));
+                        if (r > bin_best_nm[bin]) {
+                            bin_best_nm[bin] = r;
+                            bin_best_pos[bin] = .{ .lat = p.lat, .lon = p.lon };
+                        }
+                    }
+                }
+            }
+
+            const seen_s: f64 = @as(f64, @floatFromInt(now_ns - ac.last_seen_ns)) / 1e9;
+            if (seen_s > 120.0) continue;
 
             var hex_buf: [6]u8 = undefined;
             _ = try std.fmt.bufPrint(&hex_buf, "{x:0>6}", .{icao});
@@ -263,16 +278,6 @@ pub const Table = struct {
                     .alt = p.alt_ft,
                     .t = @as(f64, @floatFromInt(p.at_ns)) / 1e9,
                 };
-                if (self.receiver_lat != null and self.receiver_lon != null) {
-                    if (p.range_nm) |r| {
-                        const b = bearingDeg(self.receiver_lat.?, self.receiver_lon.?, p.lat, p.lon);
-                        const bin = @min(COVERAGE_BINS - 1, @as(usize, @intFromFloat(@floor(b / (360.0 / @as(f64, COVERAGE_BINS))))));
-                        if (r > bin_best_nm[bin]) {
-                            bin_best_nm[bin] = r;
-                            bin_best_pos[bin] = .{ .lat = p.lat, .lon = p.lon };
-                        }
-                    }
-                }
             }
             try list.append(arena, .{
                 .hex = hex,
