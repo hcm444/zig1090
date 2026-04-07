@@ -3,9 +3,6 @@
 Standalone ADS-B / Mode S demodulator in Zig with an optional local “net mode” web UI (Leaflet map + `/aircraft.json`).
 RTL-SDR IQ is read via **librtlsdr** with a small local ring buffer (see [Acknowledgments](#acknowledgments)).
 
-<img width="1934" height="1603" alt="Screenshot_20260324_220616" src="https://github.com/user-attachments/assets/deda21d2-77e0-4c5c-b0dd-2557e43c5c46" />
-
-
 ## Build
 
 ### Prerequisites
