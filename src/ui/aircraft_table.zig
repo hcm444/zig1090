@@ -6,9 +6,9 @@ const crc = @import("../mode_s/mode_s_crc.zig");
 const msdec = @import("../mode_s/mode_s_decode.zig");
 
 /// Column widths for the terminal table (header, rule line, and `render` data row must stay in sync).
-const term_table_widths = [_]u8{ 6, 8, 6, 2, 5, 5, 5, 5, 2, 10, 10, 4, 6, 3, 4, 2, 2, 5, 2, 5, 4, 1, 7 };
+const term_table_widths = [_]u8{ 6, 8, 6, 6, 2, 5, 5, 5, 5, 2, 10, 10, 4, 6, 3, 4, 2, 2, 5, 2, 2, 5, 4, 1, 7 };
 comptime {
-    std.debug.assert(term_table_widths.len == 23);
+    std.debug.assert(term_table_widths.len == 25);
 }
 
 const TRAIL_RETENTION_NS: i128 = 24 * 60 * 60 * std.time.ns_per_s;
@@ -50,13 +50,20 @@ pub const NetAircraft = struct {
     alt_baro: ?i32,
     /// True = 25 ft steps (Q); false = Gillham Mode C (100 ft) when `alt_baro` set from airborne position.
     baro_alt_is_q: ?bool,
+    /// GNSS / geometric height (ft) from TC 20–22 when decoded.
+    geom_alt_ft: ?i32,
+    /// Q-bit for `geom_alt_ft` when set from TC 20–22.
+    geom_alt_is_q: ?bool,
     /// Mode A squawk 0000–7777 (ADS-B TC 28 or future Mode S identity).
     squawk: ?u16,
     gs: ?f32,
     vert_rate: ?i32,
     /// Matches terminal `Vb`: baro (B) vs geom (G) vertical rate source when known.
     vert_rate_is_baro: ?bool,
-    emitter_category: u8,
+    /// DF17/18 CA (capability) bits 6–8.
+    capability_ca: u8,
+    /// ADS-B Aircraft Identification EC (emitter category) for TC 1–4 (ME bits 6–8).
+    emitter_category_ec: ?u8,
     on_ground: bool,
     seen: f64,
     trail: []const NetTrailPt,
@@ -71,6 +78,19 @@ pub const NetAircraft = struct {
     /// Range to receiver (NM) from latest trail point, if known.
     range_nm: ?f64,
     max_range_24h_nm: ?f64,
+    /// TC 31: ADS-B version (ME bits 41–43).
+    ads_b_version: ?u8,
+    /// TC 31: subtype 0 = airborne op, 1 = surface op.
+    op_mesub: ?u8,
+    op_nic_a: ?u8,
+    op_nic_c: ?u8,
+    op_nac_p: ?u8,
+    op_sil: ?u8,
+    /// TC 31 v2: SIL reporting type (true = per-sample, false = per-hour).
+    op_sil_per_sample: ?bool,
+    op_gva: ?u8,
+    op_nic_baro: ?u8,
+    op_nac_v_surface: ?u8,
 };
 
 pub const NetSnapshot = struct {
@@ -95,11 +115,16 @@ pub const Aircraft = struct {
     icao: u32,
     callsign: [8]u8 = [_]u8{' '} ** 8,
     callsign_len: u8 = 0,
-    /// DF17/18 emitter category (byte 0, low 3 bits); updated on every ES message.
-    emitter_category: u8 = 0,
+    /// DF17/18 CA (capability) bits 6–8; updated on every ES message.
+    capability_ca: u8 = 0,
+    /// ADS-B Aircraft Identification EC (emitter category) for TC 1–4; null until seen.
+    emitter_category_ec: ?u8 = null,
     baro_alt_ft: ?i32 = null,
     /// Set from TC 9–18 AC12 Q bit when baro alt updated from airborne position.
     baro_alt_is_q: ?bool = null,
+    /// TC 20–22 geometric / GNSS height (ft).
+    geom_alt_ft: ?i32 = null,
+    geom_alt_is_q: ?bool = null,
     /// Mode A code (squawk), 4-digit 0000–7777.
     squawk: ?u16 = null,
     ground_speed_kt: ?f32 = null,
@@ -119,6 +144,17 @@ pub const Aircraft = struct {
     nac_v: ?u8 = null,
     /// TC 19 geometric height diff vs baro altitude (ft).
     geom_delta_ft: ?i32 = null,
+    /// TC 31 operational status (last decoded v1/v2 fields).
+    ads_b_version: ?u8 = null,
+    op_mesub: ?u8 = null,
+    op_nic_a: ?u8 = null,
+    op_nic_c: ?u8 = null,
+    op_nac_p: ?u8 = null,
+    op_sil: ?u8 = null,
+    op_sil_per_sample: ?bool = null,
+    op_gva: ?u8 = null,
+    op_nic_baro: ?u8 = null,
+    op_nac_v_surface: ?u8 = null,
     on_ground: bool = false,
     msg_count: u32 = 0,
     last_seen_ns: i128 = 0,
@@ -135,7 +171,15 @@ pub const Aircraft = struct {
 
     fn copyCallsignFromBuf(ac: *Aircraft, buf: *[9]u8) void {
         const trimmed = adsb.trimCallsignPadding(buf);
-        ac.setCallsign(trimmed);
+        // Only update when the decoded callsign looks meaningful.
+        // In weak reception, TC 1–4 frames can decode to mostly spaces/'#' which would erase a good callsign.
+        var ok = false;
+        for (trimmed) |c| {
+            if (c == ' ' or c == '#') continue;
+            ok = true;
+            break;
+        }
+        if (ok) ac.setCallsign(trimmed);
     }
 };
 
@@ -238,11 +282,14 @@ pub const Table = struct {
                 .track = ac.track_deg,
                 .alt_baro = ac.baro_alt_ft,
                 .baro_alt_is_q = ac.baro_alt_is_q,
+                .geom_alt_ft = ac.geom_alt_ft,
+                .geom_alt_is_q = ac.geom_alt_is_q,
                 .squawk = ac.squawk,
                 .gs = ac.ground_speed_kt,
                 .vert_rate = ac.vert_rate_fpm,
                 .vert_rate_is_baro = ac.vert_rate_is_baro,
-                .emitter_category = ac.emitter_category,
+                .capability_ca = ac.capability_ca,
+                .emitter_category_ec = ac.emitter_category_ec,
                 .on_ground = ac.on_ground,
                 .seen = seen_s,
                 .trail = trail,
@@ -255,6 +302,16 @@ pub const Table = struct {
                 .last_conf = ac.last_conf,
                 .range_nm = latestRangeNm(&ac),
                 .max_range_24h_nm = ac.max_range_24h_nm,
+                .ads_b_version = ac.ads_b_version,
+                .op_mesub = ac.op_mesub,
+                .op_nic_a = ac.op_nic_a,
+                .op_nic_c = ac.op_nic_c,
+                .op_nac_p = ac.op_nac_p,
+                .op_sil = ac.op_sil,
+                .op_sil_per_sample = ac.op_sil_per_sample,
+                .op_gva = ac.op_gva,
+                .op_nic_baro = ac.op_nic_baro,
+                .op_nac_v_surface = ac.op_nac_v_surface,
             });
         }
 
@@ -382,7 +439,7 @@ pub const Table = struct {
         const tc = (msg[4] >> 3) & 0x1f;
         const me: u56 = if (adsb.typeCodeUsesMe(tc)) adsb.me56FromBytes(msg) else 0;
 
-        ac.emitter_category = msg[0] & 0x07;
+        ac.capability_ca = msg[0] & 0x07;
         ac.msg_count += 1;
         ac.last_seen_ns = now_ns;
         ac.last_conf = conf;
@@ -391,6 +448,9 @@ pub const Table = struct {
             var buf: [9]u8 = undefined;
             adsb.decodeCallsign(me, &buf);
             ac.copyCallsignFromBuf(&buf);
+            if (adsb.parseAircraftIdentificationEmitterCategoryEc(me, tc)) |ec| {
+                ac.emitter_category_ec = @intCast(ec);
+            }
         }
 
         if (tc >= 5 and tc <= 8) {
@@ -413,20 +473,52 @@ pub const Table = struct {
             }
         }
 
-        if (tc >= 9 and tc <= 18) {
+        if ((tc >= 9 and tc <= 18) or (tc >= 20 and tc <= 22)) {
             if (adsb.parseAirbornePosition(me, tc)) |pos| {
                 ac.on_ground = false;
                 ac.pos_ss = @intCast(pos.ss);
                 ac.pos_nic_b = @intCast(pos.nic_b);
-                ac.baro_alt_is_q = (pos.alt12 & 0x10) != 0;
-                if (adsb.decodeAc12Feet(pos.alt12)) |alt| {
-                    ac.baro_alt_ft = alt;
+                if (adsb.airbornePositionIsBaroAltitude(tc)) {
+                    ac.baro_alt_is_q = (pos.alt12 & 0x10) != 0;
+                    if (adsb.decodeAc12Feet(pos.alt12)) |alt| {
+                        ac.baro_alt_ft = alt;
+                    }
+                } else {
+                    ac.geom_alt_is_q = (pos.alt12 & 0x10) != 0;
+                    if (adsb.decodeAc12Feet(pos.alt12)) |alt| {
+                        ac.geom_alt_ft = alt;
+                    }
                 }
                 if (adsb.updateCprAndMaybeDecode(cpr_state, pos, pos.f_odd, now_ns, self.receiver_lat, self.receiver_lon)) |fix| {
                     ac.lat = fix.lat;
                     ac.lon = fix.lon;
                     try self.maybeAppendTrailPoint(ac, now_ns, fix.lat, fix.lon);
                 }
+            }
+        }
+
+        if (tc == 31) {
+            ac.op_mesub = null;
+            ac.ads_b_version = null;
+            ac.op_nic_a = null;
+            ac.op_nic_c = null;
+            ac.op_nac_p = null;
+            ac.op_sil = null;
+            ac.op_sil_per_sample = null;
+            ac.op_gva = null;
+            ac.op_nic_baro = null;
+            ac.op_nac_v_surface = null;
+            if (adsb.parseOperationalStatus(me, tc)) |op| {
+                ac.op_mesub = @intCast(op.mesub);
+                ac.ads_b_version = @intCast(op.version);
+                if (op.nic_a) |v| ac.op_nic_a = @intCast(v);
+                if (op.nic_c) |v| ac.op_nic_c = @intCast(v);
+                if (op.nac_p) |v| ac.op_nac_p = @intCast(v);
+                if (op.sil) |v| ac.op_sil = @intCast(v);
+                ac.op_sil_per_sample = op.sil_per_sample;
+                if (op.gva) |v| ac.op_gva = @intCast(v);
+                if (op.nic_baro) |v| ac.op_nic_baro = @intCast(v);
+                if (op.nac_v_surface) |v| ac.op_nac_v_surface = @intCast(v);
             }
         }
 
@@ -478,6 +570,7 @@ pub const Table = struct {
 
         var flight_buf: [9]u8 = undefined;
         var b_alt: [16]u8 = undefined;
+        var b_galt: [16]u8 = undefined;
         var b_sqk: [8]u8 = undefined;
         var b_gs: [16]u8 = undefined;
         var b_trk: [16]u8 = undefined;
@@ -488,6 +581,7 @@ pub const Table = struct {
         var b_ssnb: [8]u8 = undefined;
         var b_st: [8]u8 = undefined;
         var b_nv: [8]u8 = undefined;
+        var b_ec: [8]u8 = undefined;
         var b_rng: [16]u8 = undefined;
         var b_max_rng: [16]u8 = undefined;
         var b_trl: [8]u8 = undefined;
@@ -503,6 +597,7 @@ pub const Table = struct {
             const fl = trimTrailingSpaces(flight_buf[0..ac.callsign_len]);
 
             const alt_s = fmtOptI32(&b_alt, ac.baro_alt_ft);
+            const galt_s = fmtOptI32(&b_galt, ac.geom_alt_ft);
             const ac_enc_s = baroAltEncodingStr(ac.baro_alt_is_q);
             const sqk_s = fmtSquawk(&b_sqk, ac.squawk);
             const gs_s = fmtOptF32(&b_gs, ac.ground_speed_kt, "{d:.0}");
@@ -515,6 +610,7 @@ pub const Table = struct {
             const st_s = fmtOptU8Dash(&b_st, ac.vel_subtype);
             const nv_s = fmtOptU8Dash(&b_nv, ac.nac_v);
             const gd_s = fmtOptI32(&b_gd, ac.geom_delta_ft);
+            const ec_s = fmtOptU8Dash(&b_ec, ac.emitter_category_ec);
             const rng_s = fmtOptF64(&b_rng, latestRangeNm(ac), "{d:.1}");
             const max_rng_s = fmtOptF64(&b_max_rng, ac.max_range_24h_nm, "{d:.1}");
             const trl_s = std.fmt.bufPrint(&b_trl, "{d}", .{ac.trail.items.len}) catch "---";
@@ -524,10 +620,11 @@ pub const Table = struct {
             // NOTE: widths in Zig are minimum widths; precision caps max width.
             // The `.N` precisions below keep the table columns aligned even if any field is longer.
             var row_buf: [512]u8 = undefined;
-            const row = std.fmt.bufPrint(&row_buf, "{x:0>6} {s:<8.8} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
+            const row = std.fmt.bufPrint(&row_buf, "{x:0>6} {s:<8.8} {s:>6.6} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {s:>2.2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
                 icao,
                 flight_disp,
                 alt_s,
+                galt_s,
                 ac_enc_s,
                 sqk_s,
                 gs_s,
@@ -543,16 +640,18 @@ pub const Table = struct {
                 st_s,
                 nv_s,
                 gd_s,
-                ac.emitter_category,
+                ac.capability_ca,
+                ec_s,
                 ac.msg_count,
                 seen_s,
                 if (ac.on_ground) "G" else " ",
                 ac.last_conf,
             }) catch {
-                try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
+                try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {s:>2.2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
                     icao,
                     flight_disp,
                     alt_s,
+                    galt_s,
                     ac_enc_s,
                     sqk_s,
                     gs_s,
@@ -568,7 +667,8 @@ pub const Table = struct {
                     st_s,
                     nv_s,
                     gd_s,
-                    ac.emitter_category,
+                    ac.capability_ca,
+                    ec_s,
                     ac.msg_count,
                     seen_s,
                     if (ac.on_ground) "G" else " ",
@@ -602,7 +702,7 @@ pub const Table = struct {
             .at_ns = now_ns,
             .lat = lat,
             .lon = lon,
-            .alt_ft = ac.baro_alt_ft,
+            .alt_ft = ac.baro_alt_ft orelse ac.geom_alt_ft,
             .range_nm = range_nm,
         });
 
@@ -686,14 +786,23 @@ pub const Table = struct {
 
 fn writeTermTableHeader(w: *std.Io.Writer) !void {
     try w.print(
-        "{s:>6} {s:<8} {s:>6} {s:>2} {s:>5} {s:>5} {s:>5} {s:>5} {s:>2} {s:>10} {s:>10} {s:>4} {s:>6} {s:>3} {s:>4} {s:>2} {s:>2} {s:>5} {s:>2} {s:>5} {s:>4} {s:>1} {s:>7}\n",
-        .{ "ICAO", "Flight", "Alt", "AC", "Sqk", "GS", "Trk", "Vrate", "Vb", "Lat", "Lon", "Rng", "Max24h", "Trl", "SS/n", "ST", "Nv", "Gd", "CA", "Msgs", "Seen", "G", "Conf" },
+        "{s:>6} {s:<8} {s:>6} {s:>6} {s:>2} {s:>5} {s:>5} {s:>5} {s:>5} {s:>2} {s:>10} {s:>10} {s:>4} {s:>6} {s:>3} {s:>4} {s:>2} {s:>2} {s:>5} {s:>2} {s:>2} {s:>5} {s:>4} {s:>1} {s:>7}\n",
+        .{ "ICAO", "Flight", "Alt", "GAlt", "AC", "Sqk", "GS", "Trk", "Vrate", "Vb", "Lat", "Lon", "Rng", "Max24h", "Trl", "SS/n", "ST", "Nv", "Gd", "CA", "EC", "Msgs", "Seen", "G", "Conf" },
     );
 }
 
 fn writeTermTableRule(w: *std.Io.Writer) !void {
     // One contiguous line: avoid ~100+ tiny `writeAll("-")` calls per refresh (was measurable vs. demod loop).
-    var buf: [140]u8 = undefined;
+    const RULE_LINE_LEN: usize = comptime blk: {
+        var n: usize = 0;
+        for (term_table_widths, 0..) |wd, i| {
+            n += wd;
+            if (i != 0) n += 1; // spaces between columns
+        }
+        n += 1; // trailing newline
+        break :blk n;
+    };
+    var buf: [RULE_LINE_LEN]u8 = undefined;
     var pos: usize = 0;
     for (term_table_widths, 0..) |wd, i| {
         if (i != 0) {

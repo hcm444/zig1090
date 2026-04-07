@@ -49,6 +49,7 @@
     <div class="controls">
       <label for="swLight">Light map</label> <input id="swLight" type="checkbox" />
       <label for="swRanges">Range rings</label> <input id="swRanges" type="checkbox" />
+      <label for="swCoverage">Coverage heat</label> <input id="swCoverage" type="checkbox" />
     </div>
     <div id="acDetail"><p class="muted" style="margin:8px 0 0">Click an aircraft for the same fields as the terminal table.</p></div>
     <kbd id="hint">Loading…</kbd>
@@ -60,6 +61,7 @@
   const hint = document.getElementById("hint");
   const swLight = document.getElementById("swLight");
   const swRanges = document.getElementById("swRanges");
+  const swCoverage = document.getElementById("swCoverage");
   const acDetail = document.getElementById("acDetail");
 
   const map = L.map("map", { zoomControl: true });
@@ -96,6 +98,8 @@
   let trailLayers = {};
   let didInitialView = false;
   let ringLayer = null;
+  let coverageLayer = null;
+  let lastCoverageKey = null;
   let lastReceiver = null;
   let lastRingHits = null;
   let lastRingTotal = 0;
@@ -191,6 +195,11 @@
         else if (ac.baro_alt_is_q === false) altStr += " (Mode C 100 ft)";
         motionParts.push(altStr);
       }
+      if (ac.geom_alt_ft != null) {
+        let gStr = "gnss " + fmtAlt(ac.geom_alt_ft);
+        if (ac.geom_alt_is_q === true) gStr += " (Q)";
+        motionParts.push(gStr);
+      }
       if (ac.squawk != null) motionParts.push("sq " + String(ac.squawk).padStart(4, "0"));
       if (ac.vert_rate != null) {
         let s = String(ac.vert_rate) + " fpm";
@@ -212,7 +221,22 @@
     if (ac.vel_subtype != null) q.push("ST " + ac.vel_subtype);
     if (ac.nac_v != null) q.push("Nv " + ac.nac_v);
     if (ac.geom_delta_ft != null) q.push("Δ " + ac.geom_delta_ft + " ft");
-    q.push("CA " + ac.emitter_category);
+    q.push("CA " + ac.capability_ca);
+    if (ac.emitter_category_ec != null) q.push("EC " + ac.emitter_category_ec);
+    if (ac.ads_b_version != null) {
+      let op = "ADS v" + ac.ads_b_version;
+      if (ac.op_mesub != null) op += (ac.op_mesub === 1 ? " surf" : " air");
+      if (ac.op_nic_a != null) op += " A" + ac.op_nic_a;
+      if (ac.op_nic_c != null) op += " C" + ac.op_nic_c;
+      if (ac.op_nac_p != null) op += " p" + ac.op_nac_p;
+      if (ac.op_sil != null) op += " s" + ac.op_sil;
+      if (ac.op_sil_per_sample === true) op += "/Sm";
+      else if (ac.op_sil_per_sample === false) op += "/Hr";
+      if (ac.op_gva != null) op += " G" + ac.op_gva;
+      if (ac.op_nic_baro != null) op += " Nb" + ac.op_nic_baro;
+      if (ac.op_nac_v_surface != null) op += " NvS" + ac.op_nac_v_surface;
+      q.push(op);
+    }
     const qual = q.join(" · ");
 
     const meta = [];
@@ -228,7 +252,7 @@
     html += '<div class="ac-line">' + rangeLine + "</div>";
     html += '<div class="ac-line">' + qual + "</div>";
     html += '<div class="ac-line muted" style="font-size:11px">' + metaLine + "</div>";
-    html += '<div class="ac-hint">Trail: older→newer hue; segment color = baro alt when set</div>';
+    html += '<div class="ac-hint">Trail: older→newer hue; segment color = baro alt, else GNSS height when set</div>';
     html += "</div>";
     acDetail.innerHTML = html;
   }
@@ -317,6 +341,107 @@
 
   swRanges.addEventListener("change", updateRingOverlay);
 
+  function haversineNm(a, b) {
+    // Fast-enough great-circle distance for UI coloring (receiver-centered).
+    const d2r = Math.PI / 180;
+    const lat1 = a.lat * d2r, lon1 = a.lon * d2r;
+    const lat2 = b.lat * d2r, lon2 = b.lon * d2r;
+    const dlat = lat2 - lat1, dlon = lon2 - lon1;
+    const s1 = Math.sin(dlat / 2), s2 = Math.sin(dlon / 2);
+    const x = s1 * s1 + Math.cos(lat1) * Math.cos(lat2) * s2 * s2;
+    const c = 2 * Math.atan2(Math.sqrt(x), Math.sqrt(Math.max(0, 1 - x)));
+    return (6371000 * c) / 1852.0; // meters → nautical miles
+  }
+
+  function coverageColor(u) {
+    // u in [0,1]. Low resource: simple HSL ramp.
+    const uu = Math.max(0, Math.min(1, u));
+    const h = 35 + uu * 210; // orange→blue
+    const s = 85;
+    const l = swLight.checked ? 34 : 55;
+    return "hsl(" + h + ", " + s + "%, " + l + "%)";
+  }
+
+  function updateCoverageOverlay(coveragePts, coverageNm) {
+    if (coverageLayer) {
+      layers.removeLayer(coverageLayer);
+      coverageLayer = null;
+    }
+    if (!swCoverage.checked) return;
+    if (!lastReceiver) return;
+    if (!Array.isArray(coveragePts) || coveragePts.length === 0) return;
+
+    const g = L.layerGroup();
+    const recv = lastReceiver;
+    const maxNm = (coverageNm != null && Number.isFinite(coverageNm) && coverageNm > 0) ? coverageNm : null;
+
+    // Points: show farthest point per bearing bin (max 72 points from backend).
+    for (const p of coveragePts) {
+      if (!p || p.lat == null || p.lon == null) continue;
+      const nm = haversineNm(recv, p);
+      const u = maxNm ? (nm / maxNm) : Math.min(1, nm / 200.0);
+      L.circleMarker([p.lat, p.lon], {
+        radius: 3,
+        weight: swLight.checked ? 1 : 0,
+        opacity: swLight.checked ? 0.55 : 0.0,
+        color: swLight.checked ? "#0f2136" : "#000",
+        fillColor: coverageColor(u),
+        fillOpacity: swLight.checked ? (0.45 + 0.35 * u) : (0.30 + 0.45 * u),
+        interactive: false,
+      }).addTo(g);
+    }
+
+    // Outline: a thin polygon-ish loop so you can read coverage shape at a glance.
+    // Backend already bins by bearing; the points come out in bin order.
+    const line = [];
+    for (const p of coveragePts) {
+      if (!p || p.lat == null || p.lon == null) continue;
+      line.push([p.lat, p.lon]);
+    }
+    if (line.length >= 3) {
+      L.polyline(line.concat([line[0]]), {
+        color: swLight.checked ? "#1a2734" : "#ffffff",
+        weight: swLight.checked ? 1.2 : 1.0,
+        opacity: swLight.checked ? 0.22 : 0.14,
+        interactive: false,
+      }).addTo(g);
+    }
+
+    g.addTo(layers);
+    coverageLayer = g;
+  }
+
+  function updateCoverageOverlayIfNeeded(data) {
+    // Build a tiny key to avoid rebuilding layers every 1s tick when nothing changed.
+    const pts = data.coverage_farthest_points;
+    if (!swCoverage.checked) {
+      lastCoverageKey = null;
+      updateCoverageOverlay(null, null);
+      return;
+    }
+    const recvKey = (data.receiver && data.receiver.lat != null && data.receiver.lon != null)
+      ? (data.receiver.lat.toFixed(4) + "," + data.receiver.lon.toFixed(4))
+      : "none";
+    const len = Array.isArray(pts) ? pts.length : 0;
+    let head = "";
+    let tail = "";
+    if (len > 0) {
+      const a = pts[0], b = pts[len - 1];
+      head = (a && a.lat != null && a.lon != null) ? (a.lat.toFixed(3) + "," + a.lon.toFixed(3)) : "";
+      tail = (b && b.lat != null && b.lon != null) ? (b.lat.toFixed(3) + "," + b.lon.toFixed(3)) : "";
+    }
+    const nm = (data.coverage_nm != null && Number.isFinite(data.coverage_nm)) ? data.coverage_nm.toFixed(2) : "n";
+    const key = recvKey + "|" + nm + "|" + len + "|" + head + "|" + tail + "|" + (swLight.checked ? "L" : "D");
+    if (key === lastCoverageKey) return;
+    lastCoverageKey = key;
+    updateCoverageOverlay(pts, data.coverage_nm);
+  }
+
+  swCoverage.addEventListener("change", () => {
+    lastCoverageKey = null;
+    updateCoverageOverlayIfNeeded({ receiver: lastReceiver, coverage_farthest_points: [], coverage_nm: null });
+  });
+
   async function tick() {
     try {
       const r = await fetch("/aircraft.json", { cache: "no-store" });
@@ -327,6 +452,7 @@
       lastRingTotal = (data.ring_total_ranged_hits != null) ? data.ring_total_ranged_hits : 0;
       lastRingRates = Array.isArray(data.ring_rate_ewma_per_min) ? data.ring_rate_ewma_per_min : null;
       updateRingOverlay();
+      updateCoverageOverlayIfNeeded(data);
 
       let hintLine =
         "now: " + (data.now != null ? data.now.toFixed(3) : "?") + " s  ·  " +

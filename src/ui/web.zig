@@ -89,7 +89,11 @@ fn handleConnection(gpa: std.mem.Allocator, shared: *Shared, conn: std.net.Serve
 
         if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
             try req.respond(index_html, .{
-                .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+                // Avoid browser caching during local development; the UI is embedded at build time.
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+                    .{ .name = "cache-control", .value = "no-store" },
+                },
             });
         } else if (std.mem.eql(u8, path, "/aircraft.json") or std.mem.eql(u8, path, "/data/aircraft.json")) {
             var arena = std.heap.ArenaAllocator.init(gpa);

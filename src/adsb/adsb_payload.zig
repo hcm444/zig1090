@@ -17,9 +17,51 @@ pub fn me56FromBytes(msg: *const [14]u8) u56 {
         @as(u56, msg[10]);
 }
 
+/// ADS-B Aircraft Identification (TC 1–4) emitter category (EC, 3 bits).
+/// Layout: `TC(5) | EC(3) | C1..C8` (Junzi Sun guide, Chapter 2).
+/// With this file’s ME convention (ME bit 1 = MSB of `me`), EC is ME bits 6–8.
+pub fn parseAircraftIdentificationEmitterCategoryEc(me: u56, tc: u32) ?u3 {
+    if (tc < 1 or tc > 4) return null;
+    // ME bits 6–8 are the low 3 bits of the first ME byte (after the 5-bit TC).
+    return @truncate((me >> 48) & 0x7);
+}
+
 /// True when DF17/18 extended squitter uses the 56-bit ME field for decoded content (callsign, position, velocity, etc.).
 pub fn typeCodeUsesMe(tc: u32) bool {
-    return (tc >= 1 and tc <= 18) or tc == 19 or tc == 28;
+    return (tc >= 1 and tc <= 18) or (tc >= 20 and tc <= 22) or tc == 19 or tc == 28 or tc == 31;
+}
+
+/// ME bit indices are **1-based**, MSB of `me` is ME bit 1 (same convention as dump1090 `getbits(me, a, b)`).
+fn meGetBitsInclusive1(me: u56, first: u6, last: u6) u32 {
+    const len: u6 = last - first + 1;
+    const shift: u6 = 56 - last;
+    const mask: u56 = @truncate((@as(u64, 1) << len) - 1);
+    return @truncate((me >> shift) & mask);
+}
+
+fn meGetBit1(me: u56, bit: u6) u1 {
+    return @truncate((me >> @as(u6, 56 - bit)) & 1);
+}
+
+fn isAirbornePositionTypeCode(tc: u32) bool {
+    return (tc >= 9 and tc <= 18) or (tc >= 20 and tc <= 22);
+}
+
+/// TC 9–18 use baro alt in the 12-bit field; TC 20–22 use GNSS / HAE-style height (same 12-bit encoding as baro per DO-260 family; dump1090 uses the same decode).
+pub fn airbornePositionIsBaroAltitude(tc: u32) bool {
+    return tc >= 9 and tc <= 18;
+}
+
+test "parseAircraftIdentificationEmitterCategoryEc extracts ME bits 6-8" {
+    // Construct an ME where TC=4 and EC=5 (binary 101), rest zero.
+    // ME bit 1..5 = TC, bit 6..8 = EC. With ME MSB at bit 1:
+    // me = (TC << 51) | (EC << 48).
+    const tc: u32 = 4;
+    const ec: u3 = 5;
+    const me: u56 = (@as(u56, tc) << 51) | (@as(u56, ec) << 48);
+    try std.testing.expectEqual(@as(?u3, ec), parseAircraftIdentificationEmitterCategoryEc(me, tc));
+    try std.testing.expectEqual(@as(?u3, null), parseAircraftIdentificationEmitterCategoryEc(me, 0));
+    try std.testing.expectEqual(@as(?u3, null), parseAircraftIdentificationEmitterCategoryEc(me, 9));
 }
 
 /// Reorder 13-bit field into hex Gillham layout (readsb `decodeID13Field`).
@@ -150,10 +192,10 @@ pub const AirbornePosition = struct {
     lon_cpr: u32,
 };
 
-/// TC (metype) 9–18 airborne position; `tc == 0` means no CPR in message.
+/// TC 9–18 (baro alt) and TC 20–22 (GNSS height): same ME layout as airborne CPR position.
 pub fn parseAirbornePosition(me: u56, tc: u32) ?AirbornePosition {
     if (tc == 0) return null;
-    if (tc < 9 or tc > 18) return null;
+    if (!isAirbornePositionTypeCode(tc)) return null;
 
     return .{
         .ss = @truncate((me >> 49) & 0x3),
@@ -175,6 +217,71 @@ pub const SurfacePosition = struct {
     lat_cpr: u32,
     lon_cpr: u32,
 };
+
+/// TC 31 Aircraft Operational Status (dump1090 `decodeESOperationalStatus` for versions 1–2).
+pub const OperationalStatus = struct {
+    /// ME bits 6–8: 0 airborne status, 1 surface status.
+    mesub: u3,
+    /// ME bits 41–43: ADS-B version number.
+    version: u3,
+    /// Version 1–2: NIC supplement A (ME bit 44).
+    nic_a: ?u1 = null,
+    /// Version 2 surface: NIC supplement C (ME bit 20) when `mesub == 1` and ME bits 9–10 are 0.
+    nic_c: ?u1 = null,
+    /// Version 1–2: NACp (ME bits 45–48).
+    nac_p: ?u4 = null,
+    /// Version 1–2: SIL (ME bits 51–52).
+    sil: ?u2 = null,
+    /// Version 2 only: ME bit 55 — `true` = per-sample integrity, `false` = per hour (dump1090 `SIL_PER_SAMPLE` vs `SIL_PER_HOUR`).
+    sil_per_sample: ?bool = null,
+    /// Version 2 airborne: geometric vertical accuracy GVA (ME bits 49–50).
+    gva: ?u2 = null,
+    /// Version 1–2 airborne: barometric altitude integrity / NIC baro (ME bit 53).
+    nic_baro: ?u1 = null,
+    /// Version 2 surface: NACv (ME bits 17–19) when `mesub == 1` and ME bits 9–10 are 0.
+    nac_v_surface: ?u3 = null,
+};
+
+/// `tc` must be 31; returns null if ME subtype is not 0 or 1.
+pub fn parseOperationalStatus(me: u56, tc: u32) ?OperationalStatus {
+    if (tc != 31) return null;
+    const mesub: u3 = @truncate(meGetBitsInclusive1(me, 6, 8));
+    if (mesub != 0 and mesub != 1) return null;
+
+    const version: u3 = @truncate(meGetBitsInclusive1(me, 41, 43));
+    var out: OperationalStatus = .{
+        .mesub = mesub,
+        .version = version,
+    };
+
+    switch (version) {
+        1 => {
+            out.nic_a = @truncate(meGetBit1(me, 44));
+            out.nac_p = @truncate(meGetBitsInclusive1(me, 45, 48));
+            out.sil = @truncate(meGetBitsInclusive1(me, 51, 52));
+            if (mesub == 0) {
+                out.nic_baro = @truncate(meGetBit1(me, 53));
+            }
+        },
+        2 => {
+            out.nic_a = @truncate(meGetBit1(me, 44));
+            out.nac_p = @truncate(meGetBitsInclusive1(me, 45, 48));
+            out.sil = @truncate(meGetBitsInclusive1(me, 51, 52));
+            out.sil_per_sample = meGetBit1(me, 55) != 0;
+            if (mesub == 0) {
+                out.gva = @truncate(meGetBitsInclusive1(me, 49, 50));
+                out.nic_baro = @truncate(meGetBit1(me, 53));
+            } else {
+                if (meGetBitsInclusive1(me, 9, 10) == 0) {
+                    out.nac_v_surface = @truncate(meGetBitsInclusive1(me, 17, 19));
+                    out.nic_c = @truncate(meGetBit1(me, 20));
+                }
+            }
+        },
+        else => {},
+    }
+    return out;
+}
 
 /// TC 5–8 surface position (readsb `decodeESSurfacePosition` ME layout).
 pub fn parseSurfacePosition(me: u56, tc: u32) ?SurfacePosition {
@@ -480,7 +587,8 @@ pub fn printPayloadDecodes(
     if (parseAirbornePosition(me, tc)) |pos| {
         if (decodeAc12Feet(pos.alt12)) |alt_ft| {
             const q = (pos.alt12 & 0x10) != 0;
-            std.debug.print("  alt: {d} ft (baro, {s})\n", .{ alt_ft, if (q) "Q" else "Gillham" });
+            const src: []const u8 = if (airbornePositionIsBaroAltitude(tc)) "baro" else "gnss";
+            std.debug.print("  alt: {d} ft ({s}, {s})\n", .{ alt_ft, src, if (q) "Q" else "Gillham" });
         } else {
             std.debug.print("  alt: 0x{x:0>3} (12-bit, invalid or meters)\n", .{pos.alt12});
         }
@@ -492,6 +600,21 @@ pub fn printPayloadDecodes(
             pos.ss,
             pos.nic_b,
         });
+    }
+
+    if (tc == 31) {
+        if (parseOperationalStatus(me, tc)) |op| {
+            std.debug.print("  opstatus: ver={d} sub={d}", .{ op.version, op.mesub });
+            if (op.nic_a) |v| std.debug.print(" NICa={d}", .{v});
+            if (op.nic_c) |v| std.debug.print(" NICc={d}", .{v});
+            if (op.nac_p) |v| std.debug.print(" NACp={d}", .{v});
+            if (op.sil) |v| std.debug.print(" SIL={d}", .{v});
+            if (op.sil_per_sample) |v| std.debug.print(" SILtp={s}", .{if (v) "sample" else "hour"});
+            if (op.gva) |v| std.debug.print(" GVA={d}", .{v});
+            if (op.nic_baro) |v| std.debug.print(" NICbaro={d}", .{v});
+            if (op.nac_v_surface) |v| std.debug.print(" NACv_surf={d}", .{v});
+            std.debug.print("\n", .{});
+        }
     }
 
     if (parseVelocity(me, tc)) |v| {
@@ -531,8 +654,24 @@ test "typeCodeUsesMe" {
     try std.testing.expect(typeCodeUsesMe(4));
     try std.testing.expect(typeCodeUsesMe(11));
     try std.testing.expect(typeCodeUsesMe(19));
+    try std.testing.expect(typeCodeUsesMe(20));
+    try std.testing.expect(typeCodeUsesMe(22));
     try std.testing.expect(typeCodeUsesMe(28));
+    try std.testing.expect(typeCodeUsesMe(31));
     try std.testing.expect(!typeCodeUsesMe(0));
     try std.testing.expect(!typeCodeUsesMe(29));
-    try std.testing.expect(!typeCodeUsesMe(31));
+    try std.testing.expect(!typeCodeUsesMe(23));
+}
+
+test "parseAirbornePosition gnss tc22 same layout as baro tc11" {
+    const tc_baro: u32 = 11;
+    const tc_gnss: u32 = 22;
+    // Minimal ME: only TC differs at top; rest zeros.
+    const me_baro: u56 = @as(u56, tc_baro) << 51;
+    const me_gnss: u56 = @as(u56, tc_gnss) << 51;
+    const p1 = parseAirbornePosition(me_baro, tc_baro).?;
+    const p2 = parseAirbornePosition(me_gnss, tc_gnss).?;
+    try std.testing.expect(p1.lat_cpr == p2.lat_cpr and p1.lon_cpr == p2.lon_cpr);
+    try std.testing.expect(airbornePositionIsBaroAltitude(tc_baro));
+    try std.testing.expect(!airbornePositionIsBaroAltitude(tc_gnss));
 }
