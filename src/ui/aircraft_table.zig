@@ -14,7 +14,8 @@ comptime {
 const TRAIL_RETENTION_NS: i128 = 24 * 60 * 60 * std.time.ns_per_s;
 const TRAIL_SAMPLE_MIN_NS: i128 = 10 * std.time.ns_per_s;
 const TRAIL_MOVE_MIN_NM: f64 = 0.05;
-const COVERAGE_BINS: usize = 72;
+/// Fewer bins keep network payload smaller while still giving a smooth fog outline.
+const COVERAGE_BINS: usize = 48;
 /// Per-bearing max range + position; `at_ns` is the observation time for that max. Expires after `TRAIL_RETENTION_NS` (24h).
 pub const CoverageBin = struct {
     best_nm: f64 = -1.0,
@@ -327,7 +328,10 @@ pub const Table = struct {
             for (self.coverage_bins) |cb| {
                 if (cb.best_nm >= 0.0) {
                     if (coverage_nm == null or cb.best_nm > coverage_nm.?) coverage_nm = cb.best_nm;
-                    try pts.append(arena, .{ .lat = cb.lat, .lon = cb.lon });
+                    try pts.append(arena, .{
+                        .lat = quantizeCoord4(cb.lat),
+                        .lon = quantizeCoord4(cb.lon),
+                    });
                 }
             }
             coverage_farthest_points = try pts.toOwnedSlice(arena);
@@ -974,4 +978,9 @@ fn bearingDeg(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) f64 {
     var brng = std.math.atan2(y, x) * r2d;
     if (brng < 0.0) brng += 360.0;
     return brng;
+}
+
+/// Round coordinates to 4 decimals (~11 m) before JSON to trim payload size.
+fn quantizeCoord4(v: f64) f64 {
+    return @round(v * 1e4) / 1e4;
 }

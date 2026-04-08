@@ -225,21 +225,7 @@
     return decorated.map(x => [x.p.lat, x.p.lon]);
   }
 
-  /** Ray casting; ring[i] = [lat, lon]. */
-  function pointInPolygon(lat, lon, ring) {
-    let inside = false;
-    const n = ring.length;
-    for (let i = 0, j = n - 1; i < n; j = i++) {
-      const yi = ring[i][0], xi = ring[i][1];
-      const yj = ring[j][0], xj = ring[j][1];
-      const intersect = ((yi > lat) !== (yj > lat)) &&
-        (lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-15) + xi);
-      if (intersect) inside = !inside;
-    }
-    return inside;
-  }
-
-  /** Purple fog outside the observed coverage polygon (viewport grid). */
+  /** Purple fog outside the observed coverage polygon (stable mask). */
   function drawCoveragePurpleFog() {
     if (coverageFogLayer) {
       underlay.removeLayer(coverageFogLayer);
@@ -251,26 +237,24 @@
     if (!ring || ring.length < 3) return;
     const bounds = map.getBounds();
     const g = L.layerGroup();
-    const rows = 14, cols = 12;
-    const south = bounds.getSouth(), west = bounds.getWest(), north = bounds.getNorth(), east = bounds.getEast();
-    const dLat = (north - south) / rows;
-    const dLon = (east - west) / cols;
+    const south = bounds.getSouth();
+    const west = bounds.getWest();
+    const north = bounds.getNorth();
+    const east = bounds.getEast();
     const fillOp = swLight.checked ? 0.1 : 0.16;
     const fogColor = swLight.checked ? "#6d28d9" : "#a78bfa";
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const sw = [south + r * dLat, west + c * dLon];
-        const ne = [south + (r + 1) * dLat, west + (c + 1) * dLon];
-        const mlat = (sw[0] + ne[0]) / 2, mlon = (sw[1] + ne[1]) / 2;
-        if (pointInPolygon(mlat, mlon, ring)) continue;
-        L.rectangle([sw, ne], {
-          stroke: false,
-          fillColor: fogColor,
-          fillOpacity: fillOp,
-          interactive: false,
-        }).addTo(g);
-      }
-    }
+    const outer = [
+      [south, west],
+      [north, west],
+      [north, east],
+      [south, east],
+    ];
+    L.polygon([outer, ring], {
+      stroke: false,
+      fillColor: fogColor,
+      fillOpacity: fillOp,
+      interactive: false,
+    }).addTo(g);
     g.addTo(underlay);
     coverageFogLayer = g;
   }
