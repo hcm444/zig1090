@@ -6,6 +6,7 @@ const demod = @import("mode_s/mode_s_demod.zig");
 const msdec = @import("mode_s/mode_s_decode.zig");
 const aircraft_table = @import("ui/aircraft_table.zig");
 const web = @import("ui/web.zig");
+const net_feed = @import("net/net_feed.zig");
 
 const C32 = std.math.Complex(f32);
 
@@ -22,6 +23,14 @@ const Cli = struct {
     receiver_lon: ?f64,
     /// When set, serve map + `/aircraft.json` on this TCP port (`--http` or `--http <port>`).
     http_port: ?u16,
+    /// dump1090-style TCP outputs (raw 30002, SBS 30003, Beast 30005 by default).
+    net: bool,
+    net_bind_storage: [64]u8 = undefined,
+    net_bind_len: usize,
+    net_ro_port: ?u16,
+    net_sbs_port: ?u16,
+    net_bo_port: ?u16,
+    net_heartbeat_s: f64,
     preamble_score_min: f32,
     timing_search_halfspan_samples: f64,
     rescue_conf_scale: f32,
@@ -29,6 +38,10 @@ const Cli = struct {
     overlap_rescan_samples: usize,
     phase_enhance_weight: f32,
     conf_min_sigma: f32,
+
+    fn netBindSlice(self: *const Cli) []const u8 {
+        return self.net_bind_storage[0..self.net_bind_len];
+    }
 };
 
 fn parseCli(argv: []const []const u8) Cli {
@@ -39,6 +52,14 @@ fn parseCli(argv: []const []const u8) Cli {
     var rlat: ?f64 = null;
     var rlon: ?f64 = null;
     var http_port: ?u16 = null;
+    var net = false;
+    var net_bind_storage: [64]u8 = undefined;
+    @memcpy(net_bind_storage[0.."0.0.0.0".len], "0.0.0.0");
+    var net_bind_len: usize = "0.0.0.0".len;
+    var net_ro_port: ?u16 = null;
+    var net_sbs_port: ?u16 = null;
+    var net_bo_port: ?u16 = null;
+    var net_heartbeat_s: f64 = 60.0;
     var preamble_score_min: f32 = 1.6;
     var timing_search_halfspan_samples: f64 = 0.20;
     var rescue_conf_scale: f32 = 1.00;
@@ -182,6 +203,79 @@ fn parseCli(argv: []const []const u8) Cli {
             i += 2;
             continue;
         }
+        if (std.mem.eql(u8, a, "--net")) {
+            net = true;
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--net-bind-address")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --net-bind-address <ip>\n", .{});
+                std.posix.exit(2);
+            }
+            const s = argv[i + 1];
+            if (s.len > net_bind_storage.len) {
+                std.debug.print("--net-bind-address too long\n", .{});
+                std.posix.exit(2);
+            }
+            @memcpy(net_bind_storage[0..s.len], s);
+            net_bind_len = s.len;
+            net = true;
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--net-ro-port")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --net-ro-port <port>\n", .{});
+                std.posix.exit(2);
+            }
+            net_ro_port = std.fmt.parseInt(u16, argv[i + 1], 10) catch {
+                std.debug.print("invalid --net-ro-port\n", .{});
+                std.posix.exit(2);
+            };
+            net = true;
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--net-sbs-port")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --net-sbs-port <port>\n", .{});
+                std.posix.exit(2);
+            }
+            net_sbs_port = std.fmt.parseInt(u16, argv[i + 1], 10) catch {
+                std.debug.print("invalid --net-sbs-port\n", .{});
+                std.posix.exit(2);
+            };
+            net = true;
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--net-bo-port")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --net-bo-port <port>\n", .{});
+                std.posix.exit(2);
+            }
+            net_bo_port = std.fmt.parseInt(u16, argv[i + 1], 10) catch {
+                std.debug.print("invalid --net-bo-port\n", .{});
+                std.posix.exit(2);
+            };
+            net = true;
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--net-heartbeat")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("usage: --net-heartbeat <seconds>\n", .{});
+                std.posix.exit(2);
+            }
+            net_heartbeat_s = std.fmt.parseFloat(f64, argv[i + 1]) catch {
+                std.debug.print("invalid --net-heartbeat\n", .{});
+                std.posix.exit(2);
+            };
+            net = true;
+            i += 2;
+            continue;
+        }
         const f = std.fmt.parseFloat(f64, a) catch {
             std.debug.print("unknown argument: {s}\n", .{a});
             std.posix.exit(2);
@@ -233,6 +327,16 @@ fn parseCli(argv: []const []const u8) Cli {
         std.debug.print("--conf-min-sigma must be between 0.02 and 0.50\n", .{});
         std.posix.exit(2);
     }
+    if (net_heartbeat_s < 0.0) {
+        std.debug.print("--net-heartbeat must be >= 0 (0 disables heartbeats)\n", .{});
+        std.posix.exit(2);
+    }
+
+    if (net) {
+        if (net_ro_port == null) net_ro_port = 30002;
+        if (net_sbs_port == null) net_sbs_port = 30003;
+        if (net_bo_port == null) net_bo_port = 30005;
+    }
 
     return .{
         .verbose = verbose,
@@ -242,6 +346,13 @@ fn parseCli(argv: []const []const u8) Cli {
         .receiver_lat = rlat,
         .receiver_lon = rlon,
         .http_port = http_port,
+        .net = net,
+        .net_bind_storage = net_bind_storage,
+        .net_bind_len = net_bind_len,
+        .net_ro_port = net_ro_port,
+        .net_sbs_port = net_sbs_port,
+        .net_bo_port = net_bo_port,
+        .net_heartbeat_s = net_heartbeat_s,
         .preamble_score_min = preamble_score_min,
         .timing_search_halfspan_samples = timing_search_halfspan_samples,
         .rescue_conf_scale = rescue_conf_scale,
@@ -257,21 +368,50 @@ comptime {
 }
 const TABLE_REFRESH_NS: i128 = 250 * std.time.ns_per_ms;
 
-fn updateTableLocked(
+fn icaoFromMsg(msg: []const u8, bit_len: usize, df: u32) ?u32 {
+    if (bit_len == 112) {
+        return (@as(u32, msg[1]) << 16) | (@as(u32, msg[2]) << 8) | @as(u32, msg[3]);
+    }
+    if (bit_len != 56) return null;
+    if (df == 11) {
+        return (@as(u32, msg[1]) << 16) | (@as(u32, msg[2]) << 8) | @as(u32, msg[3]);
+    }
+    if (df == 0 or df == 4 or df == 5) {
+        var msg7: [7]u8 = undefined;
+        @memcpy(&msg7, msg[0..7]);
+        return @as(u32, crc.modesChecksum56(&msg7));
+    }
+    return null;
+}
+
+fn processDecodedMessage(
     web_sh_ptr: ?*web.Shared,
+    net_ptr: ?*net_feed.NetFeed,
     table: *aircraft_table.Table,
     now_ns: i128,
     msg: []const u8,
     bit_len: usize,
     df: u32,
     conf64: f64,
+    crc_repair_bits: u8,
     cpr_air: *std.AutoHashMap(u32, adsb.CprAirborneState),
     cpr_surf: *std.AutoHashMap(u32, adsb.CprSurfaceState),
 ) !void {
+    if (net_ptr) |n| {
+        n.emitBeastAndRaw(now_ns, msg, crc_repair_bits, conf64);
+    }
+
     const m = web_sh_ptr;
     if (m) |ws| ws.mutex.lock();
     defer if (m) |ws| ws.mutex.unlock();
     try table.updateFromModeSMessage(now_ns, msg, bit_len, df, conf64, cpr_air, cpr_surf);
+    if (net_ptr) |n| {
+        if (icaoFromMsg(msg, bit_len, df)) |icao| {
+            if (icao != 0) {
+                n.emitSbs(table, msg, bit_len, df, now_ns, crc_repair_bits, icao);
+            }
+        }
+    }
 }
 
 fn renderTableLocked(
@@ -438,6 +578,20 @@ pub fn main() !void {
     }
     defer if (http_thread) |t| t.join();
 
+    var net_feed_storage: net_feed.NetFeed = undefined;
+    var net_feed_ptr: ?*net_feed.NetFeed = null;
+    if (cli.net) {
+        try net_feed_storage.init(allocator, .{
+            .bind_addr = cli.netBindSlice(),
+            .ro_port = cli.net_ro_port,
+            .sbs_port = cli.net_sbs_port,
+            .bo_port = cli.net_bo_port,
+            .heartbeat_s = cli.net_heartbeat_s,
+        });
+        net_feed_ptr = &net_feed_storage;
+    }
+    defer if (net_feed_ptr) |p| p.deinit();
+
     var last_table_draw_ns: i128 = 0;
     var noise = NoiseEstimator{};
     var last_accept_i: usize = std.math.maxInt(usize);
@@ -564,7 +718,7 @@ pub fn main() !void {
                     continue;
                 }
                 const conf64: f64 = @as(f64, conf);
-                try updateTableLocked(web_sh_ptr, &ac_table, now_ns, msg7[0..], 56, df, conf64, &cpr_map, &cpr_surface_map);
+                try processDecodedMessage(web_sh_ptr, net_feed_ptr, &ac_table, now_ns, msg7[0..], 56, df, conf64, 0, &cpr_map, &cpr_surface_map);
                 if (cli.stats) decode_stats.accepted_56 += 1;
                 if (verbose) msdec.printVerbose(&msg7, 56, df, conf64);
                 last_accept_hash = msg_hash;
@@ -572,10 +726,14 @@ pub fn main() !void {
                 var msg14: [14]u8 = undefined;
                 demod.bitsToBytes(bits[0..112], &msg14);
                 const crc_before_ok = crc.modesChecksum(&msg14) == 0;
+                var crc_repair_bits: u8 = 0;
                 var crc_ok = crc_before_ok;
                 if (!crc_ok) {
                     crc_ok = crc.acceptOrFixSingleBit(&msg14);
-                    if (crc_ok and cli.stats) decode_stats.crc112_1bit += 1;
+                    if (crc_ok) {
+                        crc_repair_bits = 1;
+                        if (cli.stats) decode_stats.crc112_1bit += 1;
+                    }
                 }
                 if (crc_before_ok and cli.stats) decode_stats.crc112_no_repair += 1;
                 if (!crc_ok and conf >= rescue_threshold) {
@@ -593,7 +751,10 @@ pub fn main() !void {
                     );
                     demod.bitsToBytes(bits[0..112], &msg14);
                     crc_ok = crc.acceptOrFixTwoBit(&msg14, cli.crc_two_bit_max_pairs);
-                    if (crc_ok and cli.stats) decode_stats.crc112_2bit += 1;
+                    if (crc_ok) {
+                        crc_repair_bits = 2;
+                        if (cli.stats) decode_stats.crc112_2bit += 1;
+                    }
                 }
                 if (!crc_ok) {
                     i += 1;
@@ -610,7 +771,7 @@ pub fn main() !void {
                     continue;
                 }
                 const conf64: f64 = @as(f64, conf);
-                try updateTableLocked(web_sh_ptr, &ac_table, now_ns, msg14[0..], 112, df, conf64, &cpr_map, &cpr_surface_map);
+                try processDecodedMessage(web_sh_ptr, net_feed_ptr, &ac_table, now_ns, msg14[0..], 112, df, conf64, crc_repair_bits, &cpr_map, &cpr_surface_map);
                 if (cli.stats) decode_stats.accepted_112 += 1;
                 if (verbose) msdec.printVerbose(&msg14, 112, df, conf64);
                 last_accept_hash = msg_hash;

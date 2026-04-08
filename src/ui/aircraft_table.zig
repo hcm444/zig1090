@@ -224,6 +224,10 @@ pub const Table = struct {
         self.keys.deinit(self.alloc);
     }
 
+    pub fn getAircraftPtr(self: *Table, icao: u32) ?*Aircraft {
+        return self.map.getPtr(icao);
+    }
+
     /// JSON / HTTP snapshot (caller **must** hold `Web.Shared.mutex` if concurrent).
     pub fn snapshotForNet(self: *Table, arena: std.mem.Allocator, now_ns: i128, center_mhz: f64) !NetSnapshot {
         if (self.keys_dirty) {

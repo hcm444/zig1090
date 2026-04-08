@@ -68,6 +68,26 @@ zig build run -- --http 8080 --lat 39.528 --lon -119.815
 
 Then open `http://127.0.0.1:8080/`.
 
+### dump1090-style TCP feeds (`--net`)
+
+Enable the same default **listen** ports as [FlightAware dump1090](https://github.com/flightaware/dump1090) for local clients (PiAware, VirtualRadar, etc.):
+
+| Port | Role |
+|------|------|
+| 30002 | Raw output: `*<hex>;\n` |
+| 30003 | BaseStation (SBS) `MSG,...` lines |
+| 30005 | Beast **cooked** binary (Mode S short/long; 0x1a framing, 12 MHz timestamp, RSSI) |
+
+```bash
+zig build run -- --net --lat 39.528 --lon -119.815
+```
+
+- **`--net-bind-address <ip>`** — bind address (default `0.0.0.0`).
+- **`--net-ro-port`**, **`--net-sbs-port`**, **`--net-bo-port`** — override each port (setting any of these implies `--net`).
+- **`--net-heartbeat <seconds>`** — periodic keepalives (default `60`; use `0` to disable).
+
+Beast output skips frames that needed **2-bit** CRC repair (same idea as dump1090 cooked mode). Raw input (30001), Beast input (30004), and Stratux output are not implemented yet.
+
 ## Acknowledgments
 
 - **[ZigRadio](https://github.com/vsergeev/zigradio)** — [zigradio.org](https://zigradio.org). Copyright (c) Ivan (Vanya) A. Sergeev; **MIT License**. `src/rtl_iq.zig` follows the device setup and IQ scaling of ZigRadio’s `RtlSdrSource`; zig1090 no longer depends on ZigRadio as a package.
