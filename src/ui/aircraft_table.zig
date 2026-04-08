@@ -6,9 +6,9 @@ const crc = @import("../mode_s/mode_s_crc.zig");
 const msdec = @import("../mode_s/mode_s_decode.zig");
 
 /// Column widths for the terminal table (header, rule line, and `render` data row must stay in sync).
-const term_table_widths = [_]u8{ 6, 8, 6, 6, 2, 5, 5, 5, 5, 2, 10, 10, 4, 6, 3, 4, 2, 2, 5, 2, 2, 5, 4, 1, 7 };
+const term_table_widths = [_]u8{ 6, 7, 5, 5, 4, 7, 7, 14, 4, 4, 2, 10, 2, 2, 10, 4, 4, 1, 5 };
 comptime {
-    std.debug.assert(term_table_widths.len == 25);
+    std.debug.assert(term_table_widths.len == 19);
 }
 
 const TRAIL_RETENTION_NS: i128 = 24 * 60 * 60 * std.time.ns_per_s;
@@ -581,15 +581,12 @@ pub const Table = struct {
         var b_alt: [16]u8 = undefined;
         var b_galt: [16]u8 = undefined;
         var b_sqk: [8]u8 = undefined;
-        var b_gs: [16]u8 = undefined;
-        var b_trk: [16]u8 = undefined;
-        var b_vr: [16]u8 = undefined;
-        var b_lat: [16]u8 = undefined;
-        var b_lon: [16]u8 = undefined;
-        var b_gd: [16]u8 = undefined;
-        var b_ssnb: [8]u8 = undefined;
-        var b_st: [8]u8 = undefined;
-        var b_nv: [8]u8 = undefined;
+        var b_gs_trk: [8]u8 = undefined;
+        var b_vr: [8]u8 = undefined;
+        var b_pos: [16]u8 = undefined;
+        var b_qual: [12]u8 = undefined;
+        var b_op: [12]u8 = undefined;
+        var b_ca: [4]u8 = undefined;
         var b_ec: [8]u8 = undefined;
         var b_rng: [16]u8 = undefined;
         var b_max_rng: [16]u8 = undefined;
@@ -607,82 +604,43 @@ pub const Table = struct {
 
             const alt_s = fmtOptI32(&b_alt, ac.baro_alt_ft);
             const galt_s = fmtOptI32(&b_galt, ac.geom_alt_ft);
-            const ac_enc_s = baroAltEncodingStr(ac.baro_alt_is_q);
             const sqk_s = fmtSquawk(&b_sqk, ac.squawk);
-            const gs_s = fmtOptF32(&b_gs, ac.ground_speed_kt, "{d:.0}");
-            const trk_s = fmtOptF32(&b_trk, ac.track_deg, "{d:.0}");
-            const vr_s = fmtOptI32(&b_vr, ac.vert_rate_fpm);
-            const vb_s = vertRateBaroStr(ac.vert_rate_fpm, ac.vert_rate_is_baro);
-            const lat_s = fmtOptF64(&b_lat, ac.lat, "{d:.4}");
-            const lon_s = fmtOptF64(&b_lon, ac.lon, "{d:.4}");
-            const ss_nb_s = fmtSsNic(&b_ssnb, ac.pos_ss, ac.pos_nic_b);
-            const st_s = fmtOptU8Dash(&b_st, ac.vel_subtype);
-            const nv_s = fmtOptU8Dash(&b_nv, ac.nac_v);
-            const gd_s = fmtOptI32(&b_gd, ac.geom_delta_ft);
-            const ec_s = fmtOptU8Dash(&b_ec, ac.emitter_category_ec);
+            const gs_trk_s = fmtGsTrk(&b_gs_trk, ac.ground_speed_kt, ac.track_deg);
+            const vr_s = fmtVrCompact(&b_vr, ac.vert_rate_fpm, ac.vert_rate_is_baro);
+            const pos_s = fmtPosCompact(&b_pos, ac.lat, ac.lon);
+            const qual_s = fmtQualCompact(&b_qual, ac);
+            const op_s = fmtOpCompact(&b_op, ac);
             const rng_s = fmtOptF64(&b_rng, latestRangeNm(ac), "{d:.1}");
             const max_rng_s = fmtOptF64(&b_max_rng, ac.max_range_24h_nm, "{d:.1}");
-            const trl_s = std.fmt.bufPrint(&b_trl, "{d}", .{ac.trail.items.len}) catch "---";
+            const trl_s = std.fmt.bufPrint(&b_trl, "{d}", .{ac.trail.items.len}) catch "--";
 
-            const flight_disp = if (fl.len == 0) "........" else fl;
+            const flight_disp = if (fl.len == 0) "......." else fl;
 
-            // NOTE: widths in Zig are minimum widths; precision caps max width.
-            // The `.N` precisions below keep the table columns aligned even if any field is longer.
-            var row_buf: [512]u8 = undefined;
-            const row = std.fmt.bufPrint(&row_buf, "{x:0>6} {s:<8.8} {s:>6.6} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {s:>2.2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
+            var row_buf: [384]u8 = undefined;
+            const ca_s = std.fmt.bufPrint(&b_ca, "{d}", .{ac.capability_ca}) catch "-";
+            const ec_s = fmtOptU8Dash(&b_ec, ac.emitter_category_ec);
+            const row = std.fmt.bufPrint(&row_buf, "{x:0>6} {s:<7.7} {s:>5.5} {s:>5.5} {s:>4.4} {s:>7.7} {s:>7.7} {s:>14.14} {s:>4.4} {s:>4.4} {s:>2.2} {s:>10.10} {s:>2.2} {s:>2.2} {s:>10.10} {d:>4} {d:>4.1} {s:>1.1} {d:>5.3}\n", .{
                 icao,
                 flight_disp,
                 alt_s,
                 galt_s,
-                ac_enc_s,
                 sqk_s,
-                gs_s,
-                trk_s,
+                gs_trk_s,
                 vr_s,
-                vb_s,
-                lat_s,
-                lon_s,
+                pos_s,
                 rng_s,
                 max_rng_s,
                 trl_s,
-                ss_nb_s,
-                st_s,
-                nv_s,
-                gd_s,
-                ac.capability_ca,
+                qual_s,
+                ca_s,
                 ec_s,
+                op_s,
                 ac.msg_count,
                 seen_s,
-                if (ac.on_ground) "G" else " ",
+                if (ac.on_ground) "G" else "·",
                 ac.last_conf,
             }) catch {
-                try w.print("{x:0>6} {s:<8.8} {s:>6.6} {s:>6.6} {s:>2.2} {s:>5.5} {s:>5.5} {s:>5.5} {s:>5.5} {s:>2.2} {s:>10.10} {s:>10.10} {s:>4.4} {s:>6.6} {s:>3.3} {s:>4.4} {s:>2.2} {s:>2.2} {s:>5.5} {d:>2} {s:>2.2} {d:>5} {d:>4.0} {s:>1.1} {d:>7.3}\n", .{
-                    icao,
-                    flight_disp,
-                    alt_s,
-                    galt_s,
-                    ac_enc_s,
-                    sqk_s,
-                    gs_s,
-                    trk_s,
-                    vr_s,
-                    vb_s,
-                    lat_s,
-                    lon_s,
-                    rng_s,
-                    max_rng_s,
-                    trl_s,
-                    ss_nb_s,
-                    st_s,
-                    nv_s,
-                    gd_s,
-                    ac.capability_ca,
-                    ec_s,
-                    ac.msg_count,
-                    seen_s,
-                    if (ac.on_ground) "G" else " ",
-                    ac.last_conf,
-                });
+                try w.print("{x:0>6} {s}\n", .{ icao, flight_disp });
                 continue;
             };
             try w.writeAll(row);
@@ -793,10 +751,79 @@ pub const Table = struct {
     }
 };
 
+fn fmtGsTrk(buf: *[8]u8, gs: ?f32, trk: ?f32) []const u8 {
+    if (gs == null and trk == null) return "--/--";
+    if (gs == null) return std.fmt.bufPrint(buf, "-/{d:.0}", .{trk.?}) catch "--/--";
+    if (trk == null) return std.fmt.bufPrint(buf, "{d:.0}/-", .{gs.?}) catch "--/--";
+    return std.fmt.bufPrint(buf, "{d:.0}/{d:.0}", .{ gs.?, trk.? }) catch "--/--";
+}
+
+fn fmtVrCompact(buf: *[8]u8, vr: ?i32, is_baro: ?bool) []const u8 {
+    if (vr == null) return "------";
+    const tag: u8 = if (is_baro) |b| (if (b) 'B' else 'G') else '?';
+    return std.fmt.bufPrint(buf, "{d}{c}", .{ vr.?, tag }) catch "------";
+}
+
+fn fmtPosCompact(buf: *[16]u8, lat: ?f64, lon: ?f64) []const u8 {
+    if (lat == null or lon == null) return "·/·";
+    return std.fmt.bufPrint(buf, "{d:.2}/{d:.2}", .{ lat.?, lon.? }) catch "·/·";
+}
+
+fn fmtQualCompact(buf: *[12]u8, ac: *const Aircraft) []const u8 {
+    var tmp: [32]u8 = undefined;
+    const n1 = fmtSsNic(&tmp, ac.pos_ss, ac.pos_nic_b);
+    if (ac.vel_subtype == null and ac.nac_v == null and ac.geom_delta_ft == null) {
+        if (n1.len <= 12) {
+            @memcpy(buf[0..n1.len], n1);
+            return buf[0..n1.len];
+        }
+        @memcpy(buf[0..12], n1[0..12]);
+        return buf[0..12];
+    }
+    var big: [48]u8 = undefined;
+    const ext = std.fmt.bufPrint(&big, "{s}·{d}/{d}/{d}", .{
+        n1,
+        ac.vel_subtype orelse 0,
+        ac.nac_v orelse 0,
+        ac.geom_delta_ft orelse 0,
+    }) catch return n1[0..@min(12, n1.len)];
+    if (ext.len <= 12) {
+        @memcpy(buf[0..ext.len], ext);
+        return buf[0..ext.len];
+    }
+    @memcpy(buf[0..12], ext[0..12]);
+    return buf[0..12];
+}
+
+fn fmtOpCompact(buf: *[12]u8, ac: *const Aircraft) []const u8 {
+    if (ac.ads_b_version == null) return "·";
+    var w: [48]u8 = undefined;
+    var n: usize = 0;
+    n += (std.fmt.bufPrint(w[n..], "v{d}", .{ac.ads_b_version.?}) catch return "·").len;
+    if (ac.op_mesub) |m| {
+        n += (std.fmt.bufPrint(w[n..], "{s}", .{if (m == 1) "s" else "a"}) catch return opTrim12(buf, &w, n)).len;
+    }
+    if (ac.op_nic_a) |v| n += (std.fmt.bufPrint(w[n..], "A{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_nic_c) |v| n += (std.fmt.bufPrint(w[n..], "C{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_nac_p) |v| n += (std.fmt.bufPrint(w[n..], "p{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_sil) |v| n += (std.fmt.bufPrint(w[n..], "s{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_sil_per_sample) |v| n += (std.fmt.bufPrint(w[n..], "{s}", .{if (v) "Sm" else "Hr"}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_gva) |v| n += (std.fmt.bufPrint(w[n..], "G{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_nic_baro) |v| n += (std.fmt.bufPrint(w[n..], "Nb{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    if (ac.op_nac_v_surface) |v| n += (std.fmt.bufPrint(w[n..], "V{d}", .{v}) catch return opTrim12(buf, &w, n)).len;
+    return opTrim12(buf, &w, n);
+}
+
+fn opTrim12(buf: *[12]u8, w: *const [48]u8, n: usize) []const u8 {
+    const c = @min(n, 12);
+    @memcpy(buf[0..c], w[0..c]);
+    return buf[0..c];
+}
+
 fn writeTermTableHeader(w: *std.Io.Writer) !void {
     try w.print(
-        "{s:>6} {s:<8} {s:>6} {s:>6} {s:>2} {s:>5} {s:>5} {s:>5} {s:>5} {s:>2} {s:>10} {s:>10} {s:>4} {s:>6} {s:>3} {s:>4} {s:>2} {s:>2} {s:>5} {s:>2} {s:>2} {s:>5} {s:>4} {s:>1} {s:>7}\n",
-        .{ "ICAO", "Flight", "Alt", "GAlt", "AC", "Sqk", "GS", "Trk", "Vrate", "Vb", "Lat", "Lon", "Rng", "Max24h", "Trl", "SS/n", "ST", "Nv", "Gd", "CA", "EC", "Msgs", "Seen", "G", "Conf" },
+        "{s:>6} {s:<7} {s:>5} {s:>5} {s:>4} {s:>7} {s:>7} {s:>14} {s:>4} {s:>4} {s:>2} {s:>10} {s:>2} {s:>2} {s:>10} {s:>4} {s:>4} {s:>1} {s:>5}\n",
+        .{ "ICAO", "Flight", "Baro", "Geom", "Sqk", "Gs/Trk", "Vr·src", "Lat/Lon", "Rng", "Max", "Tr", "SS·ST·Nv·Δ", "CA", "EC", "TC31·op", "#", "Seen", "G", "Conf" },
     );
 }
 
