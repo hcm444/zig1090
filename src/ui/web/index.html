@@ -11,14 +11,14 @@
     #map { height: 100%; width: 100%; }
     #panel {
       position: absolute; top: 10px; right: 10px; z-index: 1000;
-      background: rgba(0,0,0,.78); color: #e8e8e8; padding: 12px 14px;
-      border-radius: 8px; max-width: min(420px, 92vw); font-size: 13px;
-      line-height: 1.45; pointer-events: auto;
+      background: rgba(0,0,0,.78); color: #e8e8e8; padding: 10px 12px;
+      border-radius: 8px; max-width: min(680px, 96vw); font-size: 13px;
+      line-height: 1.35; pointer-events: auto;
     }
     #panel h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #fff; }
     #panel .muted { color: #9aa; font-size: 12px; }
     #panel kbd { display: block; margin-top: 8px; color: #7ad; font-size: 11px; }
-    .controls { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; margin: 8px 0 2px; }
+    .controls { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; align-items: center; margin: 6px 0 0; }
     .controls label { color: #d7d7d7; font-size: 12px; }
     .controls input { transform: translateY(1px); }
 
@@ -32,20 +32,28 @@
       transform-origin: center center;
     }
 
-    #acDetail .ac-detail { margin-top: 6px; font-size: 11px; line-height: 1.4; color: #e0e0e0; }
-    #acDetail .ac-detail h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: #fff; }
+    #acDetail .ac-detail { margin-top: 4px; font-size: 10px; line-height: 1.25; color: #e0e0e0; }
+    #acDetail .ac-detail h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: #fff; }
+    #acDetail .ac-detail .ac-detail-grid {
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px 8px; align-items: start;
+    }
     #acDetail .ac-detail .ac-h2 {
-      margin: 10px 0 4px; letter-spacing: 0.04em; text-transform: uppercase;
-      font-size: 10px; font-weight: 600; color: #9aa;
+      grid-column: 1 / -1; margin: 5px 0 1px; letter-spacing: 0.03em; text-transform: uppercase;
+      font-size: 9px; font-weight: 600; color: #9aa;
     }
     #acDetail .ac-detail .ac-h2:first-of-type { margin-top: 0; }
-    #acDetail .ac-detail dl.ac-grid {
-      display: grid; grid-template-columns: minmax(7.5em, 10em) 1fr;
-      gap: 2px 10px; align-items: center; margin: 0; padding: 0;
+    #acDetail .ac-detail .ac-field {
+      display: flex; flex-direction: column; gap: 0; min-width: 0;
     }
-    #acDetail .ac-detail dl.ac-grid dt { margin: 0; padding: 2px 0; color: #9aa; font-weight: 500; }
-    #acDetail .ac-detail dl.ac-grid dd { margin: 0; padding: 2px 0; font-family: ui-monospace, monospace; color: #e8e8e8; word-break: break-word; }
-    #acDetail .ac-detail .ac-hint { margin-top: 8px; color: #7ad; font-size: 10px; line-height: 1.3; }
+    #acDetail .ac-detail .ac-field .k { color: #9aa; font-weight: 500; font-size: 9px; line-height: 1.15; }
+    #acDetail .ac-detail .ac-field .v {
+      font-family: ui-monospace, monospace; font-size: 10px; color: #e8e8e8;
+      word-break: break-word; line-height: 1.2;
+    }
+    #acDetail .ac-detail .ac-hint {
+      grid-column: 1 / -1; margin-top: 5px; color: #7ad; font-size: 9px; line-height: 1.25;
+    }
   </style>
 </head>
 <body>
@@ -57,7 +65,6 @@
       <label for="swLight">Light map</label> <input id="swLight" type="checkbox" />
       <label for="swRanges">Range rings</label> <input id="swRanges" type="checkbox" />
       <label for="swCoverage">Coverage</label> <input id="swCoverage" type="checkbox" />
-      <label for="swFog">Fog</label> <input id="swFog" type="checkbox" />
     </div>
     <div id="acDetail"><p class="muted" style="margin:8px 0 0">Click an aircraft for full decoded fields.</p></div>
     <kbd id="hint">Loading…</kbd>
@@ -70,7 +77,6 @@
   const swLight = document.getElementById("swLight");
   const swRanges = document.getElementById("swRanges");
   const swCoverage = document.getElementById("swCoverage");
-  const swFog = document.getElementById("swFog");
   const acDetail = document.getElementById("acDetail");
 
   const map = L.map("map", { zoomControl: true });
@@ -106,18 +112,16 @@
       coverage_farthest_points: lastCoveragePts || [],
       coverage_nm: lastCoverageNm,
     });
-    updateFogOverlay();
   });
 
-  /** Below aircraft markers/trails/rings (coverage + fog). */
+  /** Below aircraft markers/trails/rings (purple coverage fog). */
   const underlay = L.layerGroup().addTo(map);
   const layers = L.layerGroup().addTo(map);
   let markers = {};
   let trailLayers = {};
   let didInitialView = false;
   let ringLayer = null;
-  let coverageLayer = null;
-  let fogLayer = null;
+  let coverageFogLayer = null;
   let lastCoverageKey = null;
   let lastReceiver = null;
   let lastCoveragePts = null;
@@ -193,22 +197,17 @@
     return "—";
   }
 
-  function row(dt, val) {
+  function field(k, val) {
     const v = (val === null || val === undefined || val === "") ? "—" : String(val);
-    return "<dt>" + escHtml(dt) + "</dt><dd>" + escHtml(v) + "</dd>";
-  }
-
-  function section(title) {
-    return '<div class="ac-h2">' + escHtml(title) + "</div>";
+    return '<div class="ac-field"><span class="k">' + escHtml(k) + '</span><span class="v">' + escHtml(v) + "</span></div>";
   }
 
   function block(title, rowPairs) {
-    let b = section(title) + '<dl class="ac-grid">';
+    let b = '<div class="ac-h2">' + escHtml(title) + "</div>";
     for (let i = 0; i < rowPairs.length; i++) {
       const p = rowPairs[i];
-      b += row(p[0], p[1]);
+      b += field(p[0], p[1]);
     }
-    b += "</dl>";
     return b;
   }
 
@@ -240,12 +239,13 @@
     return inside;
   }
 
-  function updateFogOverlay() {
-    if (fogLayer) {
-      underlay.removeLayer(fogLayer);
-      fogLayer = null;
+  /** Purple fog outside the observed coverage polygon (viewport grid). */
+  function drawCoveragePurpleFog() {
+    if (coverageFogLayer) {
+      underlay.removeLayer(coverageFogLayer);
+      coverageFogLayer = null;
     }
-    if (!swFog.checked) return;
+    if (!swCoverage.checked) return;
     if (!lastReceiver || !lastCoveragePts || lastCoveragePts.length < 3) return;
     const ring = buildSortedRing(lastReceiver, lastCoveragePts);
     if (!ring || ring.length < 3) return;
@@ -255,8 +255,8 @@
     const south = bounds.getSouth(), west = bounds.getWest(), north = bounds.getNorth(), east = bounds.getEast();
     const dLat = (north - south) / rows;
     const dLon = (east - west) / cols;
-    const fillOp = swLight.checked ? 0.11 : 0.17;
-    const fogColor = swLight.checked ? "#1a2734" : "#030810";
+    const fillOp = swLight.checked ? 0.1 : 0.16;
+    const fogColor = swLight.checked ? "#6d28d9" : "#a78bfa";
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const sw = [south + r * dLat, west + c * dLon];
@@ -272,7 +272,7 @@
       }
     }
     g.addTo(underlay);
-    fogLayer = g;
+    coverageFogLayer = g;
   }
 
   function resetDetailPanel() {
@@ -294,7 +294,7 @@
 
     let html = '<div class="ac-detail">';
     html += "<h3>" + flightDisp + " <span class=\"muted\">" + hex + "</span></h3>";
-
+    html += '<div class="ac-detail-grid">';
     html += block("Identity", [
       ["ICAO hex", ac.hex],
       ["Callsign", (ac.flight || "").trim() || "—"],
@@ -350,9 +350,8 @@
       ["Message count", ac.msg_count != null ? String(ac.msg_count) : "—"],
       ["Last confidence", ac.last_conf != null && Number.isFinite(ac.last_conf) ? ac.last_conf.toFixed(4) : "—"],
     ]);
-
     html += '<div class="ac-hint">Trail on map: older→newer hue; segment color = baro alt, else GNSS height when set.</div>';
-    html += "</div>";
+    html += "</div></div>";
     acDetail.innerHTML = html;
   }
 
@@ -440,82 +439,12 @@
 
   swRanges.addEventListener("change", updateRingOverlay);
 
-  function haversineNm(a, b) {
-    // Fast-enough great-circle distance for UI coloring (receiver-centered).
-    const d2r = Math.PI / 180;
-    const lat1 = a.lat * d2r, lon1 = a.lon * d2r;
-    const lat2 = b.lat * d2r, lon2 = b.lon * d2r;
-    const dlat = lat2 - lat1, dlon = lon2 - lon1;
-    const s1 = Math.sin(dlat / 2), s2 = Math.sin(dlon / 2);
-    const x = s1 * s1 + Math.cos(lat1) * Math.cos(lat2) * s2 * s2;
-    const c = 2 * Math.atan2(Math.sqrt(x), Math.sqrt(Math.max(0, 1 - x)));
-    return (6371000 * c) / 1852.0; // meters → nautical miles
-  }
-
-  function coverageColor(u) {
-    // u in [0,1]. Low resource: simple HSL ramp.
-    const uu = Math.max(0, Math.min(1, u));
-    const h = 35 + uu * 210; // orange→blue
-    const s = 85;
-    const l = swLight.checked ? 34 : 55;
-    return "hsl(" + h + ", " + s + "%, " + l + "%)";
-  }
-
-  function updateCoverageOverlay(coveragePts, coverageNm) {
-    if (coverageLayer) {
-      underlay.removeLayer(coverageLayer);
-      coverageLayer = null;
-    }
-    if (!swCoverage.checked) return;
-    if (!lastReceiver) return;
-    if (!Array.isArray(coveragePts) || coveragePts.length === 0) return;
-
-    const g = L.layerGroup();
-    const recv = lastReceiver;
-    const maxNm = (coverageNm != null && Number.isFinite(coverageNm) && coverageNm > 0) ? coverageNm : null;
-
-    // Points: show farthest point per bearing bin (max 72 points from backend).
-    for (const p of coveragePts) {
-      if (!p || p.lat == null || p.lon == null) continue;
-      const nm = haversineNm(recv, p);
-      const u = maxNm ? (nm / maxNm) : Math.min(1, nm / 200.0);
-      L.circleMarker([p.lat, p.lon], {
-        radius: 3,
-        weight: swLight.checked ? 1 : 0,
-        opacity: swLight.checked ? 0.55 : 0.0,
-        color: swLight.checked ? "#0f2136" : "#000",
-        fillColor: coverageColor(u),
-        fillOpacity: swLight.checked ? (0.45 + 0.35 * u) : (0.30 + 0.45 * u),
-        interactive: false,
-      }).addTo(g);
-    }
-
-    // Outline: a thin polygon-ish loop so you can read coverage shape at a glance.
-    // Backend already bins by bearing; the points come out in bin order.
-    const line = [];
-    for (const p of coveragePts) {
-      if (!p || p.lat == null || p.lon == null) continue;
-      line.push([p.lat, p.lon]);
-    }
-    if (line.length >= 3) {
-      L.polyline(line.concat([line[0]]), {
-        color: swLight.checked ? "#1a2734" : "#ffffff",
-        weight: swLight.checked ? 1.2 : 1.0,
-        opacity: swLight.checked ? 0.22 : 0.14,
-        interactive: false,
-      }).addTo(g);
-    }
-
-    g.addTo(underlay);
-    coverageLayer = g;
-  }
-
   function updateCoverageOverlayIfNeeded(data) {
     // Build a tiny key to avoid rebuilding layers every 1s tick when nothing changed.
     const pts = data.coverage_farthest_points;
     if (!swCoverage.checked) {
       lastCoverageKey = null;
-      updateCoverageOverlay(null, null);
+      drawCoveragePurpleFog();
       return;
     }
     const recvKey = (data.receiver && data.receiver.lat != null && data.receiver.lon != null)
@@ -533,7 +462,7 @@
     const key = recvKey + "|" + nm + "|" + len + "|" + head + "|" + tail + "|" + (swLight.checked ? "L" : "D");
     if (key === lastCoverageKey) return;
     lastCoverageKey = key;
-    updateCoverageOverlay(pts, data.coverage_nm);
+    drawCoveragePurpleFog();
   }
 
   swCoverage.addEventListener("change", () => {
@@ -545,12 +474,8 @@
     });
   });
 
-  swFog.addEventListener("change", () => {
-    updateFogOverlay();
-  });
-
   map.on("moveend", () => {
-    if (swFog.checked) updateFogOverlay();
+    if (swCoverage.checked) drawCoveragePurpleFog();
   });
 
   async function tick() {
@@ -567,7 +492,6 @@
       lastRingRates = Array.isArray(data.ring_rate_ewma_per_min) ? data.ring_rate_ewma_per_min : null;
       updateRingOverlay();
       updateCoverageOverlayIfNeeded(data);
-      updateFogOverlay();
 
       let hintLine =
         "now: " + (data.now != null ? data.now.toFixed(3) : "?") + " s  ·  " +
