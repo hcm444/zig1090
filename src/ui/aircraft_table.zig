@@ -14,6 +14,8 @@ comptime {
 const TRAIL_RETENTION_NS: i128 = 24 * 60 * 60 * std.time.ns_per_s;
 const TRAIL_SAMPLE_MIN_NS: i128 = 10 * std.time.ns_per_s;
 const TRAIL_MOVE_MIN_NM: f64 = 0.05;
+/// Cap/decimate trail points sent to `/aircraft.json` per aircraft.
+const NET_TRAIL_MAX_POINTS: usize = 96;
 /// Fewer bins keep network payload smaller while still giving a smooth fog outline.
 const COVERAGE_BINS: usize = 48;
 /// Per-bearing max range + position; `at_ns` is the observation time for that max. Expires after `TRAIL_RETENTION_NS` (24h).
@@ -265,15 +267,7 @@ pub const Table = struct {
             else
                 try arena.dupe(u8, fl);
 
-            const trail = try arena.alloc(NetTrailPt, ac.trail.items.len);
-            for (ac.trail.items, 0..) |p, ti| {
-                trail[ti] = .{
-                    .lat = p.lat,
-                    .lon = p.lon,
-                    .alt = p.alt_ft,
-                    .t = @as(f64, @floatFromInt(p.at_ns)) / 1e9,
-                };
-            }
+            const trail = try trailForNet(arena, ac.trail.items);
             try list.append(arena, .{
                 .hex = hex,
                 .flight = flight,
@@ -983,4 +977,40 @@ fn bearingDeg(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) f64 {
 /// Round coordinates to 4 decimals (~11 m) before JSON to trim payload size.
 fn quantizeCoord4(v: f64) f64 {
     return @round(v * 1e4) / 1e4;
+}
+
+fn trailForNet(arena: std.mem.Allocator, items: []const TrailPoint) ![]NetTrailPt {
+    if (items.len == 0) return &.{};
+    if (items.len <= NET_TRAIL_MAX_POINTS) {
+        const out = try arena.alloc(NetTrailPt, items.len);
+        for (items, 0..) |p, i| {
+            out[i] = .{
+                .lat = quantizeCoord4(p.lat),
+                .lon = quantizeCoord4(p.lon),
+                .alt = p.alt_ft,
+                .t = @as(f64, @floatFromInt(p.at_ns)) / 1e9,
+            };
+        }
+        return out;
+    }
+
+    // Keep first + last point, and evenly sample the interior.
+    const out_len = NET_TRAIL_MAX_POINTS;
+    const out = try arena.alloc(NetTrailPt, out_len);
+    const in_last = items.len - 1;
+    const out_last = out_len - 1;
+    for (0..out_len) |oi| {
+        const ii: usize = if (oi == out_last)
+            in_last
+        else
+            @as(usize, @intFromFloat(@round((@as(f64, @floatFromInt(oi)) * @as(f64, @floatFromInt(in_last))) / @as(f64, @floatFromInt(out_last)))));
+        const p = items[ii];
+        out[oi] = .{
+            .lat = quantizeCoord4(p.lat),
+            .lon = quantizeCoord4(p.lon),
+            .alt = p.alt_ft,
+            .t = @as(f64, @floatFromInt(p.at_ns)) / 1e9,
+        };
+    }
+    return out;
 }
