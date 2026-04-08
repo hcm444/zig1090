@@ -15,6 +15,13 @@ const TRAIL_RETENTION_NS: i128 = 24 * 60 * 60 * std.time.ns_per_s;
 const TRAIL_SAMPLE_MIN_NS: i128 = 10 * std.time.ns_per_s;
 const TRAIL_MOVE_MIN_NM: f64 = 0.05;
 const COVERAGE_BINS: usize = 72;
+/// Per-bearing max range + position; `at_ns` is the observation time for that max. Expires after `TRAIL_RETENTION_NS` (24h).
+pub const CoverageBin = struct {
+    best_nm: f64 = -1.0,
+    lat: f64 = 0,
+    lon: f64 = 0,
+    at_ns: i128 = 0,
+};
 const RING_HALFLIFE_S: f64 = 15.0 * 60.0;
 /// `range_nm` from `greatCircleNm` is nautical miles; multiply to compare with statute-mile rings.
 const NM_TO_STATUTE_MI: f64 = 1.150779448;
@@ -197,6 +204,8 @@ pub const Table = struct {
     /// Antenna / receiver WGS84 position for CPR reference (surface global + relative, airborne relative).
     receiver_lat: ?f64,
     receiver_lon: ?f64,
+    /// Rolling 24h max range per bearing bin; survives trail point pruning until `at_ns` ages out.
+    coverage_bins: [COVERAGE_BINS]CoverageBin = [_]CoverageBin{.{}} ** COVERAGE_BINS,
 
     pub fn init(gpa: std.mem.Allocator, receiver_lat: ?f64, receiver_lon: ?f64) Table {
         return .{
@@ -237,29 +246,10 @@ pub const Table = struct {
         var list = std.ArrayList(NetAircraft).empty;
         var coverage_nm: ?f64 = null;
         var coverage_farthest_points: []const ReceiverPos = &.{};
-        var bin_best_nm: [COVERAGE_BINS]f64 = [_]f64{-1.0} ** COVERAGE_BINS;
-        var bin_best_pos: [COVERAGE_BINS]ReceiverPos = undefined;
         for (self.keys.items) |icao| {
             const ac_ptr = self.map.getPtr(icao) orelse continue;
-            // Keep 24h rolling coverage independent of "currently seen" aircraft.
             self.pruneTrail(ac_ptr, now_ns);
             const ac = ac_ptr.*;
-
-            if (ac.max_range_24h_nm) |r| {
-                if (coverage_nm == null or r > coverage_nm.?) coverage_nm = r;
-            }
-            if (self.receiver_lat != null and self.receiver_lon != null) {
-                for (ac.trail.items) |p| {
-                    if (p.range_nm) |r| {
-                        const b = bearingDeg(self.receiver_lat.?, self.receiver_lon.?, p.lat, p.lon);
-                        const bin = @min(COVERAGE_BINS - 1, @as(usize, @intFromFloat(@floor(b / (360.0 / @as(f64, COVERAGE_BINS))))));
-                        if (r > bin_best_nm[bin]) {
-                            bin_best_nm[bin] = r;
-                            bin_best_pos[bin] = .{ .lat = p.lat, .lon = p.lon };
-                        }
-                    }
-                }
-            }
 
             const seen_s: f64 = @as(f64, @floatFromInt(now_ns - ac.last_seen_ns)) / 1e9;
             if (seen_s > 120.0) continue;
@@ -329,10 +319,16 @@ pub const Table = struct {
         else
             null;
 
+        self.expireOldCoverageBins(now_ns);
+        self.seedCoverageBinsFromTrails(now_ns);
+
         if (recv != null) {
             var pts = std.ArrayList(ReceiverPos).empty;
-            for (0..COVERAGE_BINS) |i| {
-                if (bin_best_nm[i] >= 0.0) try pts.append(arena, bin_best_pos[i]);
+            for (self.coverage_bins) |cb| {
+                if (cb.best_nm >= 0.0) {
+                    if (coverage_nm == null or cb.best_nm > coverage_nm.?) coverage_nm = cb.best_nm;
+                    try pts.append(arena, .{ .lat = cb.lat, .lon = cb.lon });
+                }
             }
             coverage_farthest_points = try pts.toOwnedSlice(arena);
         }
@@ -349,6 +345,44 @@ pub const Table = struct {
             .ring_rate_ewma_per_min = self.ring_rate_ewma_per_min,
             .aircraft = try list.toOwnedSlice(arena),
         };
+    }
+
+    fn expireOldCoverageBins(self: *Table, now_ns: i128) void {
+        for (&self.coverage_bins) |*cb| {
+            if (cb.best_nm < 0.0) continue;
+            if (now_ns - cb.at_ns > TRAIL_RETENTION_NS) {
+                cb.* = .{};
+            }
+        }
+    }
+
+    fn maybeUpdateCoverageBin(self: *Table, observed_ns: i128, lat: f64, lon: f64, range_nm: f64) void {
+        if (self.receiver_lat == null or self.receiver_lon == null) return;
+        const b = bearingDeg(self.receiver_lat.?, self.receiver_lon.?, lat, lon);
+        const bin_i = @min(COVERAGE_BINS - 1, @as(usize, @intFromFloat(@floor(b / (360.0 / @as(f64, COVERAGE_BINS))))));
+        const cb = &self.coverage_bins[bin_i];
+        if (range_nm > cb.best_nm) {
+            cb.* = .{
+                .best_nm = range_nm,
+                .lat = lat,
+                .lon = lon,
+                .at_ns = observed_ns,
+            };
+        }
+    }
+
+    /// Merge in ranged trail points (<=24h old) so bins stay filled after pruning; does not shrink bins.
+    fn seedCoverageBinsFromTrails(self: *Table, now_ns: i128) void {
+        if (self.receiver_lat == null or self.receiver_lon == null) return;
+        for (self.keys.items) |icao| {
+            const ac_ptr = self.map.getPtr(icao) orelse continue;
+            for (ac_ptr.trail.items) |p| {
+                if (p.range_nm) |r| {
+                    if (now_ns - p.at_ns > TRAIL_RETENTION_NS) continue;
+                    self.maybeUpdateCoverageBin(p.at_ns, p.lat, p.lon, r);
+                }
+            }
+        }
     }
 
     /// DF17/18 extended squitter; DF11 all-call (AA); DF 0/4/5 only **update** known ICAOs (see below).
