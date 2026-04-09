@@ -1,5 +1,5 @@
-//! Decode the 56-bit ADS-B ME field (DF17/18). Not encryption — standard ICAO bit layouts.
-//! Bit layouts follow readsb `mode_s.c` (1-based ME bit indices → MSB of `me` is ME bit 1).
+//! Decode the 56-bit ADS-B ME field (DF17/18). Not encryption - standard ICAO bit layouts.
+//! This module follows Annex 10 / DO-260 bit indexing (ME bit 1 is the MSB of `me`).
 
 const std = @import("std");
 const cpr = @import("cpr_decode.zig");
@@ -31,7 +31,7 @@ pub fn typeCodeUsesMe(tc: u32) bool {
     return (tc >= 1 and tc <= 18) or (tc >= 20 and tc <= 22) or tc == 19 or tc == 28 or tc == 31;
 }
 
-/// ME bit indices are **1-based**, MSB of `me` is ME bit 1 (same convention as dump1090 `getbits(me, a, b)`).
+/// ME bit indices are **1-based**, MSB of `me` is ME bit 1.
 fn meGetBitsInclusive1(me: u56, first: u6, last: u6) u32 {
     const len: u6 = last - first + 1;
     const shift: u6 = 56 - last;
@@ -47,7 +47,8 @@ fn isAirbornePositionTypeCode(tc: u32) bool {
     return (tc >= 9 and tc <= 18) or (tc >= 20 and tc <= 22);
 }
 
-/// TC 9–18 use baro alt in the 12-bit field; TC 20–22 use GNSS / HAE-style height (same 12-bit encoding as baro per DO-260 family; dump1090 uses the same decode).
+/// TC 9-18 use baro alt in the 12-bit field; TC 20-22 use GNSS / HAE-style height.
+/// Both use the same 12-bit encoding family in DO-260.
 pub fn airbornePositionIsBaroAltitude(tc: u32) bool {
     return tc >= 9 and tc <= 18;
 }
@@ -64,7 +65,7 @@ test "parseAircraftIdentificationEmitterCategoryEc extracts ME bits 6-8" {
     try std.testing.expectEqual(@as(?u3, null), parseAircraftIdentificationEmitterCategoryEc(me, 9));
 }
 
-/// Reorder 13-bit field into hex Gillham layout (readsb `decodeID13Field`).
+/// Reorder 13-bit field into hex Gillham layout.
 pub fn decodeId13FieldGillham(id13: u32) u32 {
     const x = id13 & 0x1FFF;
     var g: u32 = 0;
@@ -83,7 +84,7 @@ pub fn decodeId13FieldGillham(id13: u32) u32 {
     return g;
 }
 
-/// Mode A Gillham → Mode C altitude in 100 ft units (dump1090 `ModeAToModeC`).
+/// Mode A Gillham -> Mode C altitude in 100 ft units.
 fn modeAToModeC(mode_a: u32) ?i32 {
     if ((mode_a & 0xFFFF8889) != 0) return null;
     if ((mode_a & 0x000000F0) == 0) return null;
@@ -218,7 +219,7 @@ pub const SurfacePosition = struct {
     lon_cpr: u32,
 };
 
-/// TC 31 Aircraft Operational Status (dump1090 `decodeESOperationalStatus` for versions 1–2).
+/// TC 31 Aircraft Operational Status for ADS-B versions 1-2.
 pub const OperationalStatus = struct {
     /// ME bits 6–8: 0 airborne status, 1 surface status.
     mesub: u3,
@@ -232,7 +233,7 @@ pub const OperationalStatus = struct {
     nac_p: ?u4 = null,
     /// Version 1–2: SIL (ME bits 51–52).
     sil: ?u2 = null,
-    /// Version 2 only: ME bit 55 — `true` = per-sample integrity, `false` = per hour (dump1090 `SIL_PER_SAMPLE` vs `SIL_PER_HOUR`).
+    /// Version 2 only: ME bit 55 - `true` = per-sample integrity, `false` = per hour.
     sil_per_sample: ?bool = null,
     /// Version 2 airborne: geometric vertical accuracy GVA (ME bits 49–50).
     gva: ?u2 = null,
@@ -283,7 +284,7 @@ pub fn parseOperationalStatus(me: u56, tc: u32) ?OperationalStatus {
     return out;
 }
 
-/// TC 5–8 surface position (readsb `decodeESSurfacePosition` ME layout).
+/// TC 5-8 surface position ME layout.
 pub fn parseSurfacePosition(me: u56, tc: u32) ?SurfacePosition {
     if (tc < 5 or tc > 8) return null;
 
@@ -303,7 +304,7 @@ pub fn parseSurfacePosition(me: u56, tc: u32) ?SurfacePosition {
     };
 }
 
-/// ADS-B movement field v0 (ground speed kt, midpoint; readsb `decodeMovementFieldV0`).
+/// ADS-B movement field v0 (ground speed kt, midpoint mapping).
 pub fn decodeMovementFieldV0(movement: u32) f32 {
     if (movement == 0 or movement >= 125) return 0;
     if (movement == 124) return 180;

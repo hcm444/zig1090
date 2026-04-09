@@ -1,4 +1,4 @@
-//! Mode S / ADS-B parity (CRC-24). Matches readsb `crc.c` (`modesChecksum`, generator `0xFFF409`).
+//! Mode S / ADS-B parity (CRC-24) using generator `0xFFF409` per common ICAO decoders.
 
 const std = @import("std");
 
@@ -92,7 +92,7 @@ pub fn modesChecksum(message: *const [14]u8) u24 {
     return modesChecksumUnchecked14(message);
 }
 
-/// 56-bit (7-byte) CRC remainder (same polynomial as readsb `modesChecksum`).
+/// 56-bit (7-byte) CRC remainder using the same Mode S CRC-24 polynomial.
 /// Meaning depends on DF: **DF11** (PI) upper 17 bits are zero when valid (II may occupy low 7);
 /// **DF 0/4/5** (address parity) equals the 24-bit ICAO address; **not** generally zero.
 pub fn modesChecksum56(message: *const [7]u8) u24 {
@@ -100,12 +100,12 @@ pub fn modesChecksum56(message: *const [7]u8) u24 {
     return modesChecksumUnchecked7(message);
 }
 
-/// DF11 all-call (parity/interrogator): valid when only the low 7 bits may be nonzero (dump1090 `correctMessage`).
+/// DF11 all-call (parity/interrogator): valid when only the low 7 bits may be nonzero.
 pub fn df11ParityOk(s: u24) bool {
     return (s & 0xFFFF80) == 0;
 }
 
-/// Accept a 56-bit frame per downlink parity type (dump1090 `decodeModesMessage` / `correctMessage`).
+/// Accept a 56-bit frame per downlink parity type.
 /// - **DF 0, 4, 5**: address parity — remainder is the aircraft address; always accept (no bit-fix to zero).
 /// - **DF 11**: parity/interrogator — accept if `(remainder & 0xFFFF80) == 0`, or try a single-bit flip to achieve that.
 /// - **Other** short DFs: reject (we do not validate their parity here).
@@ -171,7 +171,7 @@ test "crc init" {
     try std.testing.expect(crc_table[1] != 0);
 }
 
-test "df11 parity mask matches dump1090" {
+test "df11 parity mask behavior" {
     try std.testing.expect(df11ParityOk(0));
     try std.testing.expect(df11ParityOk(0x7f)); // II only
     try std.testing.expect(!df11ParityOk(0x80));

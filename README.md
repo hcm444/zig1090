@@ -93,6 +93,12 @@ Beast cooked skips 2-bit CRC–repaired frames. Raw input (30001), Beast input (
 - **[dump1090](https://github.com/flightaware/dump1090) / readsb** — de-facto Mode S message layout and CRC behavior for interoperability.
 - **Maps** — [OpenStreetMap](https://www.openstreetmap.org/copyright) & [CARTO](https://carto.com/attributions) tiles; [Leaflet](https://leafletjs.com/).
 
+## Provenance
+
+- This codebase is an independent Zig implementation of publicly documented ADS-B / Mode S behavior (ICAO Annex 10 and DO-260 family conventions).
+- References to dump1090/readsb are interoperability notes and naming comparisons, not copied source.
+- See `THIRD_PARTY_NOTICES.md` for third-party attribution and bundled-asset licensing notes.
+
 ## Notes
 
 - ADS-B on 1090 MHz is public signaling; “decoding” here means parsing the ME field.

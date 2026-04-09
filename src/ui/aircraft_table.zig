@@ -1,4 +1,4 @@
-//! Per-ICAO state and periodic table render (dump1090-style).
+//! Per-ICAO state and periodic table render for local monitoring.
 
 const std = @import("std");
 const adsb = @import("../adsb/adsb_payload.zig");
@@ -386,7 +386,7 @@ pub const Table = struct {
     /// DF17/18 extended squitter; DF11 all-call (AA); DF 0/4/5 only **update** known ICAOs (see below).
     ///
     /// Address-parity short replies (DF 0/4/5) carry the ICAO in the CRC remainder, not in plaintext.
-    /// Without a readsb-style `icaoFilter`, creating new rows from those remainders floods the table with
+    /// Without an ICAO-address filter for these short replies, creating new rows from those remainders floods the table with
     /// noise addresses. We therefore only apply alt/squawk from DF 0/4/5 when that ICAO already exists
     /// (usually from DF17/18 or DF11).
     pub fn updateFromModeSMessage(

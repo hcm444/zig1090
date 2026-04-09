@@ -1,5 +1,5 @@
 //! Mode S Manchester demodulation at 1 Mbit/s with variable sample rate.
-//! Preamble and chip timing follow dump1090 scaling from a 2.0 Msps reference.
+//! Preamble and chip timing use a 2.0 Msps reference scaling commonly used by Mode S decoders.
 
 const std = @import("std");
 const C32 = std.math.Complex(f32);
@@ -129,7 +129,7 @@ pub fn preambleScore(
 ) f32 {
     if (i + params.preamble_samples > energy.len) return 0.0;
 
-    // Hot fast-path: 2.0 Msps has fixed preamble sample offsets (dump1090 reference).
+    // Hot fast-path: 2.0 Msps has fixed preamble sample offsets.
     if (@abs(params.samples_per_half_chip - 1.0) < 1e-12) {
         // Pulses at 0, 1.0us, 3.5us, 4.5us -> samples 0,2,7,9 at 2 Msps.
         const p0 = energy[i + 0];

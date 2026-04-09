@@ -1,6 +1,6 @@
 //! Compact Position Reporting (CPR) decode for ICAO 1090 MHz extended squitter.
 //! Formulas and NL(lat) ladder follow the ADS-B MOPS (e.g. 1090-WP-9-14 / DO-260 family).
-//! Results align with common open decoders (dump1090, readsb) used as interoperability checks.
+//! Results are validated against published CPR math and cross-checked for interoperability.
 
 const std = @import("std");
 

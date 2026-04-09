@@ -1,9 +1,10 @@
-//! Downlink format routing (dump1090-style: `(df & 0x10) != 0` → 112 bits else 56).
+//! Downlink format routing per ICAO framing convention:
+//! `(df & 0x10) != 0` -> 112 bits, else 56 bits.
 
 const std = @import("std");
 const adsb = @import("../adsb/adsb_payload.zig");
 
-/// ICAO / dump1090: DF with bit 0x10 set uses long (112-bit) messages.
+/// ICAO framing convention: DF with bit 0x10 set uses long (112-bit) messages.
 pub fn modeSBitLength(df: u32) usize {
     return if ((df & 0x10) != 0) 112 else 56;
 }
