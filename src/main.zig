@@ -23,7 +23,7 @@ const Cli = struct {
     receiver_lon: ?f64,
     /// When set, serve map + `/aircraft.json` on this TCP port (`--http` or `--http <port>`).
     http_port: ?u16,
-    /// dump1090-style TCP outputs (raw 30002, SBS 30003, Beast 30005 by default).
+    /// TCP outputs (raw 30002, SBS 30003, Beast 30005 by default).
     net: bool,
     net_bind_storage: [64]u8 = undefined,
     net_bind_len: usize,

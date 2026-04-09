@@ -1,4 +1,4 @@
-//! Raw TCP output (`*HEX;\\n`) matching flightaware/dump1090 `modesSendRawOutput` without MLAT timestamps.
+//! Raw TCP output (`*HEX;\\n`) compatible with common ADS-B raw feed consumers (without MLAT timestamps).
 
 const std = @import("std");
 

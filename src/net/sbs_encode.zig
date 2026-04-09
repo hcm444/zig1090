@@ -1,4 +1,4 @@
-//! BaseStation / SBS TCP output matching flightaware/dump1090 `modesSendSBSOutput` (baro path, no `--gnss`).
+//! BaseStation / SBS TCP output for common SBS consumers (baro path, no `--gnss`).
 
 const std = @import("std");
 const adsb = @import("../adsb/adsb_payload.zig");

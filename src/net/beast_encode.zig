@@ -1,4 +1,4 @@
-//! Beast binary output matching flightaware/dump1090 `writeBeastMessage` (cooked path).
+//! Beast binary output compatible with common cooked Beast feed consumers.
 
 const std = @import("std");
 
@@ -18,7 +18,7 @@ pub fn timestamp12MHz(now_ns: i128) u48 {
     return @truncate(@as(u48, @intCast(ticks & 0xFFFFFFFFFFFF)));
 }
 
-/// dump1090: `sig = round(sqrt(signalLevel) * 255)` with clamps; `signalLevel` is demod power.
+/// Maps demod signal power to Beast RSSI byte via `round(sqrt(signalLevel) * 255)` with clamps.
 pub fn signalLevelToRssiByte(signal_level: f64) u8 {
     var sig: i32 = @intFromFloat(@round(@sqrt(signal_level) * 255.0));
     if (signal_level > 0 and sig < 1) sig = 1;
@@ -56,7 +56,7 @@ pub fn encodeModeSFrame(buf: []u8, timestamp48: u48, signal_level: f64, msg: []c
     return len;
 }
 
-/// Beast heartbeat frame from dump1090 `send_beast_heartbeat`.
+/// Beast heartbeat frame used by common feed clients.
 pub fn encodeHeartbeat(buf: []u8) error{NoSpace}!usize {
     const heartbeat = [_]u8{ 0x1a, '1', 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     if (heartbeat.len > buf.len) return error.NoSpace;

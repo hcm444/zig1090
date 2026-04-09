@@ -1,4 +1,4 @@
-//! dump1090-style TCP listeners: raw output (30002), SBS (30003), Beast cooked (30005), plus heartbeats.
+//! TCP listeners for common ADS-B feed formats: raw (30002), SBS (30003), Beast cooked (30005), plus heartbeats.
 
 const std = @import("std");
 const beast_encode = @import("beast_encode.zig");
@@ -11,7 +11,7 @@ pub const Config = struct {
     ro_port: ?u16 = null,
     sbs_port: ?u16 = null,
     bo_port: ?u16 = null,
-    /// Seconds between heartbeats (dump1090 default ~60). Use 0 to disable.
+    /// Seconds between heartbeats (common default ~60). Use 0 to disable.
     heartbeat_s: f64 = 60.0,
 };
 
