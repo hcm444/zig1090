@@ -1,30 +1,37 @@
 //! BaseStation / SBS TCP output matching flightaware/dump1090 `modesSendSBSOutput` (baro path, no `--gnss`).
 
 const std = @import("std");
-const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("time.h");
-});
 const adsb = @import("../adsb/adsb_payload.zig");
 const msdec = @import("../mode_s/mode_s_decode.zig");
 const aircraft_table = @import("../ui/aircraft_table.zig");
 
+/// Wall-clock fields for SBS lines. Uses **UTC** via `std.time.epoch` so Windows builds do not depend on
+/// `localtime_s` / UCRT linking (lld was failing on `localtime_s`).
 fn formatWallClock(ymd: *[10]u8, hms: *[12]u8, ms_since_epoch: i128) void {
     const sec = @divFloor(ms_since_epoch, 1000);
     const milli = @as(u32, @intCast(@mod(ms_since_epoch, 1000)));
-    var t: c.time_t = @intCast(sec);
-    var tm: c.struct_tm = undefined;
-    const ok = if (builtin.os.tag == .windows)
-        c.localtime_s(&tm, &t) == 0
-    else
-        c.localtime_r(&t, &tm) != null;
-    if (!ok) {
+    if (sec < 0) {
         @memcpy(ymd, "1970/01/01");
         @memcpy(hms, "00:00:00.000");
         return;
     }
-    _ = std.fmt.bufPrint(ymd, "{d:0>4}/{d:0>2}/{d:0>2}", .{ @as(i32, tm.tm_year) + 1900, tm.tm_mon + 1, tm.tm_mday }) catch {};
-    _ = std.fmt.bufPrint(hms, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ tm.tm_hour, tm.tm_min, tm.tm_sec, milli }) catch {};
+    const su64: u64 = @intCast(@min(sec, @as(i128, std.math.maxInt(u64))));
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = su64 };
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_secs.getDaySeconds();
+    _ = std.fmt.bufPrint(ymd, "{d:0>4}/{d:0>2}/{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+    }) catch {};
+    _ = std.fmt.bufPrint(hms, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+        milli,
+    }) catch {};
 }
 
 fn callsignSlice(ac: *const aircraft_table.Aircraft) []const u8 {
