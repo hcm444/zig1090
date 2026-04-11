@@ -51,8 +51,12 @@ const NoiseEstimator = struct {
     initialized: bool = false,
     /// EMA blend; lower = steadier, higher = more responsive.
     alpha: f32 = 0.05,
-    /// Subsample stride for per-frame estimation.
+    /// Subsample stride for per-frame mean/variance (Welford).
     stride: usize = 16,
+    /// Low energy level for preamble scoring: EMA of per-frame ~10th percentile of subsampled |IQ|².
+    /// Unlike `mean`, this stays near true noise when the frame is full of Mode S pulses (mean is biased high).
+    preamble_floor: f32 = 0.0,
+    preamble_floor_initialized: bool = false,
 
     fn update(self: *NoiseEstimator, energy: []const f32) void {
         var mean: f32 = 0.0;
@@ -76,12 +80,49 @@ const NoiseEstimator = struct {
             self.mean = mean;
             self.var_pop = var_pop;
             self.initialized = true;
-            return;
+        } else {
+            const a = self.alpha;
+            self.mean = self.mean * (1.0 - a) + mean * a;
+            self.var_pop = self.var_pop * (1.0 - a) + var_pop * a;
         }
 
+        self.updatePreambleFloorFromFrame(energy);
+    }
+
+    /// Per-frame lower tail of energy (subsampled), then EMA; used only for `preambleScore` noise reference.
+    fn updatePreambleFloorFromFrame(self: *NoiseEstimator, energy: []const f32) void {
+        if (energy.len == 0) return;
+
+        const max_bins: usize = 512;
+        const coarse = @max(1, (energy.len + max_bins - 1) / max_bins);
+        const step = @max(@max(1, self.stride), coarse);
+
+        var buf: [max_bins]f32 = undefined;
+        var count: usize = 0;
+        var j: usize = 0;
+        while (j < energy.len and count < max_bins) : (j += step) {
+            buf[count] = energy[j];
+            count += 1;
+        }
+        if (count == 0) return;
+
+        std.mem.sort(f32, buf[0..count], {}, std.sort.asc(f32));
+        const rank = (count -| 1) * 10 / 100;
+        const raw = buf[rank];
+
+        if (!self.preamble_floor_initialized) {
+            self.preamble_floor = raw;
+            self.preamble_floor_initialized = true;
+            return;
+        }
         const a = self.alpha;
-        self.mean = self.mean * (1.0 - a) + mean * a;
-        self.var_pop = self.var_pop * (1.0 - a) + var_pop * a;
+        self.preamble_floor = self.preamble_floor * (1.0 - a) + raw * a;
+    }
+
+    /// Noise reference for preamble pulse/gap SNR in `demod.preambleScore` (not for confidence σ).
+    fn preambleNoiseFloor(self: *const NoiseEstimator) f32 {
+        if (!self.preamble_floor_initialized) return @max(1e-12, self.mean);
+        return @max(1e-12, self.preamble_floor);
     }
 
     fn stddev(self: *const NoiseEstimator) f32 {
@@ -252,13 +293,13 @@ pub fn runRtl1090(allocator: std.mem.Allocator, cli: cli_mod.Cli) !void {
         const frame = available[0..FRAME_N];
         fillEnergy(frame, &energy);
         noise.update(&energy);
-        const noise_mean = noise.mean;
+        const preamble_noise_floor = noise.preambleNoiseFloor();
         const noise_std = noise.stddev();
         const now_ns = std.time.nanoTimestamp();
 
         var i: usize = 0;
         while (i + dparams.messageExtentSamples(112) < FRAME_N) {
-            const preamble_score = demod.preambleScore(&energy, i, noise_mean, dparams);
+            const preamble_score = demod.preambleScore(&energy, i, preamble_noise_floor, dparams);
             if (preamble_score < cli.preamble_score_min) {
                 i += 1;
                 continue;

@@ -121,6 +121,8 @@ pub fn likelyPreamble(
 
 /// Returns a quality score for a potential preamble candidate.
 /// Higher scores indicate stronger pulse/gap contrast and better SNR.
+/// `noise_floor` should track **quiet** energy (e.g. a low percentile of the frame), not the frame mean,
+/// which is biased high when the window is full of replies.
 pub fn preambleScore(
     energy: []const f32,
     i: usize,
